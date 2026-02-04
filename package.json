@@ -30,6 +30,7 @@
     "@kamino-finance/klend-sdk": "^2.0.0",
     "@drift-labs/sdk": "^2.0.0",
     "@jup-ag/api": "^6.0.0",
+    "@solprism/sdk": "^0.1.0",
     "axios": "^1.6.0",
     "ws": "^8.14.0",
     "dotenv": "^16.3.0"

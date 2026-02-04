@@ -115,11 +115,36 @@ Configure `WEBHOOK_URL` in `.env` to receive alerts:
 - **Project**: [SENTINEL](https://colosseum.com/agent-hackathon/projects/sentinel-autonomous-defi-risk-guardian)
 - **Team**: Solo
 
+## SOLPRISM — Verifiable Risk Reasoning
+
+SENTINEL integrates [SOLPRISM](https://www.solprism.app) to make every risk decision verifiable onchain. Before any alert or rebalance action, SENTINEL commits a cryptographic hash of its full reasoning to Solana. After the action executes, the reasoning is revealed — creating a tamper-proof audit trail.
+
+**Why this matters:**
+- Risk decisions are provably committed *before* the market moves
+- No post-hoc rationalization of risk assessments
+- Full verifiable audit trail for DeFi risk management
+- Other agents can verify SENTINEL's risk calls before acting on them
+
+```bash
+# Enable in .env
+SOLPRISM_ENABLED=true
+SOLPRISM_KEYPAIR_PATH=./sentinel-keypair.json
+```
+
+See [docs/SOLPRISM_INTEGRATION.md](docs/SOLPRISM_INTEGRATION.md) for full integration guide.
+
+| Component | Details |
+|-----------|---------|
+| SDK | `@solprism/sdk` v0.1.0 |
+| Program | `CZcvoryaQNrtZ3qb3gC1h9opcYpzEP1D9Mu1RVwFQeBu` |
+| Explorer | [solprism.app](https://www.solprism.app) |
+
 ## Integration Partners
 
 Interested in integrating? See our [forum post](https://colosseum.com/agent-hackathon/forum/704).
 
 Current integration discussions:
+- **SOLPRISM** - Verifiable risk reasoning (✅ integrated)
 - AgentDEX - Pre/post trade risk checks
 - VoxSwarm - Multi-agent voting for risk decisions
 - IBRL - Sovereign vault protection
