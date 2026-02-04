@@ -1,6 +1,4 @@
-```typescript
 import axios from 'axios';
-import { Connection, PublicKey } from '@solana/web3.js';
 
 const JUPITER_PRICE_API = 'https://price.jup.ag/v4';
 const JUPITER_QUOTE_API = 'https://quote-api.jup.ag/v6';
@@ -19,7 +17,7 @@ export interface PriceResponse {
   timeTaken: number;
 }
 
-export interface QuoteResponse {
+export interface SwapQuote {
   inputMint: string;
   inAmount: string;
   outputMint: string;
@@ -27,34 +25,51 @@ export interface QuoteResponse {
   otherAmountThreshold: string;
   swapMode: string;
   slippageBps: number;
-  platformFee: null | any;
+  platformFee: null;
   priceImpactPct: string;
   routePlan: RoutePlan[];
+  contextSlot: number;
+  timeTaken: number;
 }
 
 export interface RoutePlan {
-  swapInfo: {
-    ammKey: string;
-    label: string;
-    inputMint: string;
-    outputMint: string;
-    inAmount: string;
-    outAmount: string;
-    feeAmount: string;
-    feeMint: string;
-  };
+  swapInfo: SwapInfo;
   percent: number;
 }
 
+export interface SwapInfo {
+  ammKey: string;
+  label: string;
+  inputMint: string;
+  outputMint: string;
+  inAmount: string;
+  outAmount: string;
+  feeAmount: string;
+  feeMint: string;
+}
+
+export interface PriceImpact {
+  percentage: number;
+  severity: 'low' | 'medium' | 'high' | 'extreme';
+  estimatedSlippage: number;
+}
+
 export interface RebalanceRoute {
-  fromMint: string;
-  toMint: string;
-  amount: string;
+  inputToken: string;
+  outputToken: string;
+  inputAmount: string;
   expectedOutput: string;
-  priceImpact: number;
-  routes: RoutePlan[];
-  slippageBps: number;
-  fee: string;
+  priceImpact: PriceImpact;
+  route: SwapQuote;
+  priority: number;
+}
+
+export interface OptimalRebalanceStrategy {
+  routes: RebalanceRoute[];
+  totalPriceImpact: number;
+  estimatedGasFeesSOL: number;
+  expectedExecutionTime: number;
+  riskLevel: 'low' | 'medium' | 'high';
 }
 
 // Common Solana token mints
@@ -70,9 +85,7 @@ export const TOKENS = {
 
 export class JupiterPriceFeed {
   private cache: Map<string, { price: TokenPrice; timestamp: number }> = new Map();
-  private quoteCache: Map<string, { quote: QuoteResponse; timestamp: number }> = new Map();
   private cacheTtl: number = 10000; // 10 seconds
-  private quoteCacheTtl: number = 5000; // 5 seconds for quotes
 
   async getPrice(mint: string): Promise<TokenPrice | null> {
     // Check cache
@@ -131,21 +144,19 @@ export class JupiterPriceFeed {
     return result;
   }
 
-  async getQuote(
+  async getSolPrice(): Promise<number> {
+    const price = await this.getPrice(TOKENS.SOL);
+    return price?.price || 0;
+  }
+
+  async getSwapQuote(
     inputMint: string,
     outputMint: string,
     amount: string,
     slippageBps: number = 50
-  ): Promise<QuoteResponse | null> {
-    const cacheKey = `${inputMint}-${outputMint}-${amount}-${slippageBps}`;
-    const cached = this.quoteCache.get(cacheKey);
-    
-    if (cached && Date.now() - cached.timestamp < this.quoteCacheTtl) {
-      return cached.quote;
-    }
-
+  ): Promise<SwapQuote | null> {
     try {
-      const response = await axios.get<QuoteResponse>(`${JUPITER_QUOTE_API}/quote`, {
+      const response = await axios.get(`${JUPITER_QUOTE_API}/quote`, {
         params: {
           inputMint,
           outputMint,
@@ -156,46 +167,135 @@ export class JupiterPriceFeed {
         }
       });
 
-      this.quoteCache.set(cacheKey, { quote: response.data, timestamp: Date.now() });
-      return response.data;
+      return response.data as SwapQuote;
     } catch (error) {
-      console.error('[JUPITER] Error fetching quote:', error);
+      console.error(`[JUPITER] Error fetching swap quote:`, error);
       return null;
     }
   }
 
-  async calculatePriceImpact(
-    inputMint: string,
-    outputMint: string,
-    amount: string
-  ): Promise<number> {
-    const quote = await this.getQuote(inputMint, outputMint, amount);
-    if (!quote) return 0;
+  calculatePriceImpact(quote: SwapQuote): PriceImpact {
+    const impactPct = parseFloat(quote.priceImpactPct);
+    
+    let severity: 'low' | 'medium' | 'high' | 'extreme';
+    if (impactPct <= 0.1) severity = 'low';
+    else if (impactPct <= 0.5) severity = 'medium';
+    else if (impactPct <= 2.0) severity = 'high';
+    else severity = 'extreme';
 
-    return parseFloat(quote.priceImpactPct);
+    return {
+      percentage: impactPct,
+      severity,
+      estimatedSlippage: quote.slippageBps / 100
+    };
   }
 
-  async findOptimalRebalanceRoute(
-    fromMint: string,
-    toMint: string,
-    amount: string,
-    maxSlippageBps: number = 100,
-    maxPriceImpact: number = 2.0
-  ): Promise<RebalanceRoute | null> {
-    // Try different slippage tolerances to find optimal route
-    const slippageOptions = [50, 100, 150, 200];
-    let bestRoute: RebalanceRoute | null = null;
-    let bestScore = -1;
+  async findOptimalRebalanceRoutes(
+    rebalances: Array<{ from: string; to: string; amount: string; priority: number }>
+  ): Promise<OptimalRebalanceStrategy> {
+    const routes: RebalanceRoute[] = [];
+    let totalPriceImpact = 0;
 
-    for (const slippageBps of slippageOptions) {
-      if (slippageBps > maxSlippageBps) continue;
+    // Sort by priority (higher first)
+    const sortedRebalances = rebalances.sort((a, b) => b.priority - a.priority);
 
-      const quote = await this.getQuote(fromMint, toMint, amount, slippageBps);
-      if (!quote) continue;
+    for (const rebalance of sortedRebalances) {
+      const quote = await this.getSwapQuote(
+        rebalance.from,
+        rebalance.to,
+        rebalance.amount,
+        100 // 1% slippage for emergency rebalancing
+      );
 
-      const priceImpact = parseFloat(quote.priceImpactPct);
-      if (priceImpact > maxPriceImpact) continue;
+      if (quote) {
+        const priceImpact = this.calculatePriceImpact(quote);
+        
+        const route: RebalanceRoute = {
+          inputToken: rebalance.from,
+          outputToken: rebalance.to,
+          inputAmount: rebalance.amount,
+          expectedOutput: quote.outAmount,
+          priceImpact,
+          route: quote,
+          priority: rebalance.priority
+        };
 
-      // Score based on output amount (higher is better) and lower price impact
-      const outputAmount = parseFloat(quote.outAmount);
-      const score = outputAmount / (1 + priceImpact / 100);
+        routes.push(route);
+        totalPriceImpact += priceImpact.percentage;
+      }
+    }
+
+    // Estimate gas fees (average 0.001 SOL per swap)
+    const estimatedGasFeesSOL = routes.length * 0.001;
+
+    // Estimate execution time (2 seconds per swap + network delays)
+    const expectedExecutionTime = routes.length * 2.5;
+
+    // Determine risk level
+    let riskLevel: 'low' | 'medium' | 'high';
+    if (totalPriceImpact <= 0.5) riskLevel = 'low';
+    else if (totalPriceImpact <= 2.0) riskLevel = 'medium';
+    else riskLevel = 'high';
+
+    return {
+      routes,
+      totalPriceImpact,
+      estimatedGasFeesSOL,
+      expectedExecutionTime,
+      riskLevel
+    };
+  }
+
+  async getEmergencyRebalanceStrategy(
+    currentPositions: Map<string, number>,
+    targetPositions: Map<string, number>,
+    emergencyThreshold: number = 5.0 // 5% max price impact per swap
+  ): Promise<OptimalRebalanceStrategy> {
+    const rebalances: Array<{ from: string; to: string; amount: string; priority: number }> = [];
+
+    // Calculate required rebalances
+    for (const [token, currentAmount] of currentPositions) {
+      const targetAmount = targetPositions.get(token) || 0;
+      const difference = currentAmount - targetAmount;
+
+      if (Math.abs(difference) > 0.001) { // Ignore dust amounts
+        if (difference > 0) {
+          // Need to sell this token
+          const sellAmount = Math.floor(difference * 1000000).toString(); // Convert to lamports/smallest unit
+          
+          // Find best token to buy
+          for (const [targetToken, targetAmt] of targetPositions) {
+            const currentTargetAmount = currentPositions.get(targetToken) || 0;
+            if (currentTargetAmount < targetAmt) {
+              rebalances.push({
+                from: token,
+                to: targetToken,
+                amount: sellAmount,
+                priority: Math.abs(difference) // Higher difference = higher priority
+              });
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    // Filter routes by emergency threshold
+    const strategy = await this.findOptimalRebalanceRoutes(rebalances);
+    const filteredRoutes = strategy.routes.filter(route => 
+      route.priceImpact.percentage <= emergencyThreshold
+    );
+
+    return {
+      ...strategy,
+      routes: filteredRoutes,
+      totalPriceImpact: filteredRoutes.reduce((sum, route) => sum + route.priceImpact.percentage, 0)
+    };
+  }
+
+  clearCache(): void {
+    this.cache.clear();
+  }
+}
+
+export const jupiterPriceFeed = new JupiterPriceFeed();
