@@ -1,6 +1,9 @@
+```typescript
 import axios from 'axios';
+import { Connection, PublicKey } from '@solana/web3.js';
 
 const JUPITER_PRICE_API = 'https://price.jup.ag/v4';
+const JUPITER_QUOTE_API = 'https://quote-api.jup.ag/v6';
 
 export interface TokenPrice {
   id: string;
@@ -16,6 +19,44 @@ export interface PriceResponse {
   timeTaken: number;
 }
 
+export interface QuoteResponse {
+  inputMint: string;
+  inAmount: string;
+  outputMint: string;
+  outAmount: string;
+  otherAmountThreshold: string;
+  swapMode: string;
+  slippageBps: number;
+  platformFee: null | any;
+  priceImpactPct: string;
+  routePlan: RoutePlan[];
+}
+
+export interface RoutePlan {
+  swapInfo: {
+    ammKey: string;
+    label: string;
+    inputMint: string;
+    outputMint: string;
+    inAmount: string;
+    outAmount: string;
+    feeAmount: string;
+    feeMint: string;
+  };
+  percent: number;
+}
+
+export interface RebalanceRoute {
+  fromMint: string;
+  toMint: string;
+  amount: string;
+  expectedOutput: string;
+  priceImpact: number;
+  routes: RoutePlan[];
+  slippageBps: number;
+  fee: string;
+}
+
 // Common Solana token mints
 export const TOKENS = {
   SOL: 'So11111111111111111111111111111111111111112',
@@ -29,7 +70,9 @@ export const TOKENS = {
 
 export class JupiterPriceFeed {
   private cache: Map<string, { price: TokenPrice; timestamp: number }> = new Map();
+  private quoteCache: Map<string, { quote: QuoteResponse; timestamp: number }> = new Map();
   private cacheTtl: number = 10000; // 10 seconds
+  private quoteCacheTtl: number = 5000; // 5 seconds for quotes
 
   async getPrice(mint: string): Promise<TokenPrice | null> {
     // Check cache
@@ -88,14 +131,71 @@ export class JupiterPriceFeed {
     return result;
   }
 
-  async getSolPrice(): Promise<number> {
-    const price = await this.getPrice(TOKENS.SOL);
-    return price?.price || 0;
+  async getQuote(
+    inputMint: string,
+    outputMint: string,
+    amount: string,
+    slippageBps: number = 50
+  ): Promise<QuoteResponse | null> {
+    const cacheKey = `${inputMint}-${outputMint}-${amount}-${slippageBps}`;
+    const cached = this.quoteCache.get(cacheKey);
+    
+    if (cached && Date.now() - cached.timestamp < this.quoteCacheTtl) {
+      return cached.quote;
+    }
+
+    try {
+      const response = await axios.get<QuoteResponse>(`${JUPITER_QUOTE_API}/quote`, {
+        params: {
+          inputMint,
+          outputMint,
+          amount,
+          slippageBps,
+          onlyDirectRoutes: false,
+          asLegacyTransaction: false
+        }
+      });
+
+      this.quoteCache.set(cacheKey, { quote: response.data, timestamp: Date.now() });
+      return response.data;
+    } catch (error) {
+      console.error('[JUPITER] Error fetching quote:', error);
+      return null;
+    }
   }
 
-  clearCache(): void {
-    this.cache.clear();
-  }
-}
+  async calculatePriceImpact(
+    inputMint: string,
+    outputMint: string,
+    amount: string
+  ): Promise<number> {
+    const quote = await this.getQuote(inputMint, outputMint, amount);
+    if (!quote) return 0;
 
-export const jupiterPriceFeed = new JupiterPriceFeed();
+    return parseFloat(quote.priceImpactPct);
+  }
+
+  async findOptimalRebalanceRoute(
+    fromMint: string,
+    toMint: string,
+    amount: string,
+    maxSlippageBps: number = 100,
+    maxPriceImpact: number = 2.0
+  ): Promise<RebalanceRoute | null> {
+    // Try different slippage tolerances to find optimal route
+    const slippageOptions = [50, 100, 150, 200];
+    let bestRoute: RebalanceRoute | null = null;
+    let bestScore = -1;
+
+    for (const slippageBps of slippageOptions) {
+      if (slippageBps > maxSlippageBps) continue;
+
+      const quote = await this.getQuote(fromMint, toMint, amount, slippageBps);
+      if (!quote) continue;
+
+      const priceImpact = parseFloat(quote.priceImpactPct);
+      if (priceImpact > maxPriceImpact) continue;
+
+      // Score based on output amount (higher is better) and lower price impact
+      const outputAmount = parseFloat(quote.outAmount);
+      const score = outputAmount / (1 + priceImpact / 100);
