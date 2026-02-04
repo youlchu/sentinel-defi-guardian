@@ -119,6 +119,20 @@ export class MarginfiMonitor {
     }
   }
 
+  async getAccountByAddress(address: PublicKey): Promise<MarginfiAccount | null> {
+    try {
+      const accountInfo = await this.connection.getAccountInfo(address);
+      if (!accountInfo || accountInfo.owner.toBase58() !== MARGINFI_PROGRAM_ID.toBase58()) {
+        return null;
+      }
+
+      return await this.parseAccount(address, accountInfo.data);
+    } catch (error) {
+      console.error(`[MARGINFI] Error fetching account ${address.toBase58()}:`, error);
+      return null;
+    }
+  }
+
   private async parseAccount(address: PublicKey, data: Buffer): Promise<MarginfiAccount> {
     const discriminator = data.slice(0, 8);
     const owner = new PublicKey(data.slice(8, 40));
@@ -210,7 +224,7 @@ export class MarginfiMonitor {
       if (!bank) continue;
 
       const price = await this.getOraclePrice(bank.config.oracleKey);
-      if (!price) continue;
+      if (!price || price.price <= 0) continue;
 
       const assetAmount = Number(balance.assetShares) * bank.assetShareValue;
       const liabilityAmount = Number(balance.liabilityShares) * bank.liabilityShareValue;
@@ -463,7 +477,14 @@ export class MarginfiMonitor {
       const accountInfo = await this.connection.getAccountInfo(oracleKey);
       if (!accountInfo) return null;
 
-      const price = this.parsePythPrice(accountInfo.data);
+      let price: OraclePrice | null = null;
+
+      if (this.isPythOracle(accountInfo.data)) {
+        price = this.parsePythPrice(accountInfo.data);
+      } else if (this.isSwitchboardOracle(accountInfo.data)) {
+        price = this.parseSwitchboardPrice(accountInfo.data);
+      }
+
       if (price) {
         this.priceCache.set(key, price);
       }
@@ -473,6 +494,21 @@ export class MarginfiMonitor {
       console.error(`[MARGINFI] Error fetching oracle price for ${key}:`, error);
       return null;
     }
+  }
+
+  private isPythOracle(data: Buffer): boolean {
+    if (data.length < 16) return false;
+    const magic = data.readUInt32LE(0);
+    const version = data.readUInt32LE(4);
+    const type = data.readUInt32LE(8);
+    return magic === 0xa1b2c3d4 && version === 2 && type === 3;
+  }
+
+  private isSwitchboardOracle(data: Buffer): boolean {
+    if (data.length < 8) return false;
+    const discriminator = data.slice(0, 8);
+    const sbDiscriminator = Buffer.from([41, 53, 204, 47, 119, 23, 151, 162]);
+    return discriminator.equals(sbDiscriminator);
   }
 
   private parsePythPrice(data: Buffer): OraclePrice | null {
@@ -509,6 +545,10 @@ export class MarginfiMonitor {
       const price = Number(aggregatePrice) * Math.pow(10, exponent);
       const confidence = Number(aggregateConf) * Math.pow(10, exponent);
 
+      if (aggregateStatus !== 1) {
+        return null;
+      }
+
       return {
         price,
         confidence,
@@ -516,6 +556,35 @@ export class MarginfiMonitor {
       };
     } catch (error) {
       console.error('[MARGINFI] Error parsing Pyth price:', error);
+      return null;
+    }
+  }
+
+  private parseSwitchboardPrice(data: Buffer): OraclePrice | null {
+    try {
+      let offset = 8;
+      
+      const result = data.readDoubleLE(offset);
+      offset += 8;
+      
+      const lastUpdateTimestamp = data.readBigInt64LE(offset);
+      offset += 8;
+      
+      const minResponse = data.readDoubleLE(offset);
+      offset += 8;
+      
+      const maxResponse = data.readDoubleLE(offset);
+      offset += 8;
+
+      const confidence = Math.abs(maxResponse - minResponse) / 2;
+
+      return {
+        price: result,
+        confidence,
+        lastUpdatedSlot: Number(lastUpdateTimestamp) / 1000
+      };
+    } catch (error) {
+      console.error('[MARGINFI] Error parsing Switchboard price:', error);
       return null;
     }
   }
@@ -542,6 +611,10 @@ export class MarginfiMonitor {
     });
   }
 
+  unsubscribe(subscriptionId: number): void {
+    this.connection.removeAccountChangeListener(subscriptionId);
+  }
+
   clearCache(): void {
     this.bankCache.clear();
     this.priceCache.clear();
@@ -553,5 +626,28 @@ export class MarginfiMonitor {
 
   getPriceCache(): Map<string, OraclePrice> {
     return new Map(this.priceCache);
+  }
+
+  async refreshBankData(bankAddress: PublicKey): Promise<BankData | null> {
+    try {
+      const accountInfo = await this.connection.getAccountInfo(bankAddress);
+      if (!accountInfo) return null;
+
+      const bankData = this.parseBankData(accountInfo.data);
+      if (bankData) {
+        this.bankCache.set(bankAddress.toBase58(), bankData);
+      }
+      
+      return bankData;
+    } catch (error) {
+      console.error(`[MARGINFI] Error refreshing bank data for ${bankAddress.toBase58()}:`, error);
+      return null;
+    }
+  }
+
+  async refreshOraclePrice(oracleKey: PublicKey): Promise<OraclePrice | null> {
+    const key = oracleKey.toBase58();
+    this.priceCache.delete(key);
+    return await this.getOraclePrice(oracleKey);
   }
 }
