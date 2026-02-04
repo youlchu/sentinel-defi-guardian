@@ -6,6 +6,7 @@ export const KAMINO_LENDING_MARKET = new PublicKey('7u3HeHxYDLhnCoErrtycNokbQYbW
 
 const WAD = new BN('1000000000000000000'); // 18 decimals
 const PERCENT_SCALE = 10000;
+const PRECISION_FACTOR = new BN('1000000000000000000'); // 18 decimals for precise calculations
 
 export interface KaminoReserve {
   address: PublicKey;
@@ -57,6 +58,11 @@ export interface KaminoObligation {
   calculatedLtv: number;
   calculatedHealthFactor: number;
   liquidationRisk: 'safe' | 'warning' | 'danger' | 'liquidatable';
+  preciseLtv: BN;
+  preciseHealthFactor: BN;
+  liquidationThreshold: number;
+  effectiveLiquidationThreshold: BN;
+  borrowUtilization: number;
 }
 
 export interface KaminoDeposit {
@@ -65,6 +71,9 @@ export interface KaminoDeposit {
   marketValue: BN;
   attributedBorrowValue: BN;
   cumulativeDepositRateWads: BN;
+  actualDepositAmount: BN;
+  reserveLtv: number;
+  reserveLiquidationThreshold: number;
 }
 
 export interface KaminoBorrow {
@@ -73,6 +82,8 @@ export interface KaminoBorrow {
   cumulativeBorrowRateWads: BN;
   marketValue: BN;
   borrowedAmount: BN;
+  interestAccrued: BN;
+  borrowWeight: number;
 }
 
 export interface ObligationCalculations {
@@ -85,6 +96,24 @@ export interface ObligationCalculations {
   liquidationPrice: number;
   isLiquidatable: boolean;
   utilizationRatio: number;
+  preciseLtv: BN;
+  preciseHealthFactor: BN;
+  effectiveLiquidationThreshold: BN;
+  borrowCapacityRemaining: BN;
+  liquidationBuffer: BN;
+  riskWeightedValue: BN;
+}
+
+export interface LiquidationThresholdBreakdown {
+  perAsset: Array<{
+    mint: PublicKey;
+    depositValue: BN;
+    liquidationThreshold: number;
+    contribution: number;
+  }>;
+  weighted: number;
+  effective: BN;
+  buffer: BN;
 }
 
 export class KaminoMonitor {
@@ -236,28 +265,44 @@ export class KaminoMonitor {
 
       const deposits: KaminoDeposit[] = [];
       for (let i = 0; i < Math.min(depositsLen, 8); i++) {
-        const offset = 200 + i * 56;
+        const offset = 200 + i * 72;
+        const depositReserve = new PublicKey(data.subarray(offset, offset + 32));
+        const depositedAmount = new BN(data.subarray(offset + 32, offset + 40), 'le');
+        const marketValue = new BN(data.subarray(offset + 40, offset + 48), 'le');
+        const attributedBorrowValue = new BN(data.subarray(offset + 48, offset + 56), 'le');
+        const cumulativeDepositRateWads = new BN(data.subarray(offset + 56, offset + 72), 'le');
+        
+        const reserve = this.reserves.get(depositReserve.toBase58());
+        const actualDepositAmount = reserve && !cumulativeDepositRateWads.isZero() ? 
+          depositedAmount.mul(cumulativeDepositRateWads).div(PRECISION_FACTOR) : 
+          depositedAmount;
+
         deposits.push({
-          depositReserve: new PublicKey(data.subarray(offset, offset + 32)),
-          depositedAmount: new BN(data.subarray(offset + 32, offset + 40), 'le'),
-          marketValue: new BN(data.subarray(offset + 40, offset + 48), 'le'),
-          attributedBorrowValue: new BN(data.subarray(offset + 48, offset + 56), 'le'),
-          cumulativeDepositRateWads: new BN(data.subarray(offset + 56, offset + 72), 'le'),
+          depositReserve,
+          depositedAmount,
+          marketValue,
+          attributedBorrowValue,
+          cumulativeDepositRateWads,
+          actualDepositAmount,
+          reserveLtv: reserve?.config.loanToValueRatio || 0,
+          reserveLiquidationThreshold: reserve?.config.liquidationThreshold || 0,
         });
       }
 
       const borrows: KaminoBorrow[] = [];
       for (let i = 0; i < Math.min(borrowsLen, 8); i++) {
-        const offset = 648 + i * 72;
+        const offset = 776 + i * 88;
         const borrowReserve = new PublicKey(data.subarray(offset, offset + 32));
         const borrowedAmountWads = new BN(data.subarray(offset + 32, offset + 48), 'le');
         const cumulativeBorrowRateWads = new BN(data.subarray(offset + 48, offset + 64), 'le');
         const marketValue = new BN(data.subarray(offset + 64, offset + 72), 'le');
         
         const reserve = this.reserves.get(borrowReserve.toBase58());
-        const borrowedAmount = reserve ? 
+        const borrowedAmount = reserve && !reserve.liquidity.cumulativeBorrowRateWads.isZero() ? 
           borrowedAmountWads.div(reserve.liquidity.cumulativeBorrowRateWads) : 
           new BN(0);
+
+        const interestAccrued = borrowedAmountWads.sub(borrowedAmount);
 
         borrows.push({
           borrowReserve,
@@ -265,10 +310,12 @@ export class KaminoMonitor {
           cumulativeBorrowRateWads,
           marketValue,
           borrowedAmount,
+          interestAccrued,
+          borrowWeight: 1.0,
         });
       }
 
-      const calculations = await this.calculateObligationMetrics(deposits, borrows);
+      const calculations = await this.calculatePreciseObligationMetrics(deposits, borrows);
 
       return {
         address,
@@ -289,21 +336,27 @@ export class KaminoMonitor {
         calculatedLtv: calculations.weightedLtv,
         calculatedHealthFactor: calculations.healthFactor,
         liquidationRisk: this.assessLiquidationRisk(calculations.healthFactor),
+        preciseLtv: calculations.preciseLtv,
+        preciseHealthFactor: calculations.preciseHealthFactor,
+        liquidationThreshold: calculations.liquidationThreshold,
+        effectiveLiquidationThreshold: calculations.effectiveLiquidationThreshold,
+        borrowUtilization: calculations.utilizationRatio,
       };
     } catch (error) {
       throw new Error(`Failed to parse obligation data: ${error}`);
     }
   }
 
-  private async calculateObligationMetrics(
+  private async calculatePreciseObligationMetrics(
     deposits: KaminoDeposit[],
     borrows: KaminoBorrow[]
   ): Promise<ObligationCalculations> {
     let totalDepositedValue = new BN(0);
     let totalBorrowedValue = new BN(0);
-    let weightedLtvSum = 0;
+    let weightedLtvNumerator = new BN(0);
     let maxBorrowValue = new BN(0);
-    let liquidationThresholdSum = 0;
+    let liquidationThresholdNumerator = new BN(0);
+    let riskWeightedValue = new BN(0);
 
     for (const deposit of deposits) {
       const reserve = this.reserves.get(deposit.depositReserve.toBase58());
@@ -312,32 +365,68 @@ export class KaminoMonitor {
       const depositValue = deposit.marketValue;
       totalDepositedValue = totalDepositedValue.add(depositValue);
 
-      const ltv = reserve.config.loanToValueRatio;
-      const liquidationThreshold = reserve.config.liquidationThreshold;
+      const ltvBN = new BN(Math.floor(reserve.config.loanToValueRatio * PERCENT_SCALE));
+      const liquidationThresholdBN = new BN(Math.floor(reserve.config.liquidationThreshold * PERCENT_SCALE));
       
-      const depositValueNum = depositValue.toNumber();
-      weightedLtvSum += ltv * depositValueNum;
-      liquidationThresholdSum += liquidationThreshold * depositValueNum;
+      const ltvContribution = depositValue.mul(ltvBN);
+      const liquidationContribution = depositValue.mul(liquidationThresholdBN);
       
-      const borrowPower = depositValue.muln(ltv * 100).divn(100);
+      weightedLtvNumerator = weightedLtvNumerator.add(ltvContribution);
+      liquidationThresholdNumerator = liquidationThresholdNumerator.add(liquidationContribution);
+      
+      const borrowPower = depositValue.mul(ltvBN).div(new BN(PERCENT_SCALE));
       maxBorrowValue = maxBorrowValue.add(borrowPower);
+
+      const riskWeight = Math.max(0.5, reserve.config.liquidationThreshold - 0.1);
+      const riskWeightedContribution = depositValue.muln(Math.floor(riskWeight * PERCENT_SCALE)).divn(PERCENT_SCALE);
+      riskWeightedValue = riskWeightedValue.add(riskWeightedContribution);
     }
 
     for (const borrow of borrows) {
-      totalBorrowedValue = totalBorrowedValue.add(borrow.marketValue);
+      const reserve = this.reserves.get(borrow.borrowReserve.toBase58());
+      const borrowValue = borrow.marketValue;
+      
+      let adjustedBorrowValue = borrowValue;
+      if (reserve) {
+        const borrowWeight = 1.0 + (reserve.liquidity.borrowedAmountWads.toNumber() / Math.pow(10, 18)) * 0.05;
+        adjustedBorrowValue = borrowValue.muln(Math.floor(borrowWeight * 100)).divn(100);
+      }
+      
+      totalBorrowedValue = totalBorrowedValue.add(adjustedBorrowValue);
     }
 
-    const totalDepositedValueNum = totalDepositedValue.toNumber();
-    const weightedLtv = totalDepositedValueNum > 0 ? weightedLtvSum / totalDepositedValueNum : 0;
-    const liquidationThreshold = totalDepositedValueNum > 0 ? liquidationThresholdSum / totalDepositedValueNum : 0;
+    const preciseLtv = totalDepositedValue.isZero() ? 
+      new BN(0) : 
+      weightedLtvNumerator.div(totalDepositedValue);
+
+    const effectiveLiquidationThreshold = totalDepositedValue.isZero() ? 
+      new BN(0) : 
+      liquidationThresholdNumerator.div(totalDepositedValue);
+
+    const preciseHealthFactor = totalBorrowedValue.isZero() ? 
+      PRECISION_FACTOR.muln(1000) : 
+      effectiveLiquidationThreshold.mul(totalDepositedValue).div(totalBorrowedValue).div(new BN(PERCENT_SCALE));
+
+    const weightedLtv = totalDepositedValue.isZero() ? 
+      0 : 
+      preciseLtv.toNumber() / PERCENT_SCALE;
+
+    const liquidationThreshold = totalDepositedValue.isZero() ? 
+      0 : 
+      effectiveLiquidationThreshold.toNumber() / PERCENT_SCALE;
 
     const healthFactor = totalBorrowedValue.isZero() ? 
       Infinity : 
-      (liquidationThreshold * totalDepositedValueNum) / totalBorrowedValue.toNumber();
+      (liquidationThreshold * totalDepositedValue.toNumber()) / totalBorrowedValue.toNumber();
 
     const utilizationRatio = totalDepositedValue.isZero() ? 
       0 : 
       totalBorrowedValue.toNumber() / totalDepositedValue.toNumber();
+
+    const borrowCapacityRemaining = maxBorrowValue.sub(totalBorrowedValue);
+    const liquidationBuffer = effectiveLiquidationThreshold.mul(totalDepositedValue)
+      .div(new BN(PERCENT_SCALE))
+      .sub(totalBorrowedValue);
 
     return {
       totalDepositedValue,
@@ -346,13 +435,19 @@ export class KaminoMonitor {
       healthFactor,
       liquidationThreshold,
       maxBorrowValue,
-      liquidationPrice: this.calculateLiquidationPrice(deposits, borrows),
-      isLiquidatable: healthFactor < 1.0,
+      liquidationPrice: this.calculatePreciseLiquidationPrice(deposits, borrows),
+      isLiquidatable: preciseHealthFactor.lt(PRECISION_FACTOR),
       utilizationRatio,
+      preciseLtv,
+      preciseHealthFactor,
+      effectiveLiquidationThreshold,
+      borrowCapacityRemaining,
+      liquidationBuffer,
+      riskWeightedValue,
     };
   }
 
-  private calculateLiquidationPrice(deposits: KaminoDeposit[], borrows: KaminoBorrow[]): number {
+  private calculatePreciseLiquidationPrice(deposits: KaminoDeposit[], borrows: KaminoBorrow[]): number {
     if (deposits.length === 0 || borrows.length === 0) return 0;
 
     const largestDeposit = deposits.reduce((max, deposit) => 
@@ -367,19 +462,64 @@ export class KaminoMonitor {
     );
 
     const liquidationThreshold = reserve.config.liquidationThreshold;
-    const collateralAmount = largestDeposit.depositedAmount.toNumber() / 
+    const collateralAmount = largestDeposit.actualDepositAmount.toNumber() / 
       Math.pow(10, reserve.liquidity.mintDecimals);
 
     if (collateralAmount === 0) return 0;
 
-    return totalBorrowValue.toNumber() / (collateralAmount * liquidationThreshold * Math.pow(10, 8));
+    const liquidationBonus = reserve.config.liquidationBonus;
+    const effectiveThreshold = liquidationThreshold * (1 - liquidationBonus);
+
+    return totalBorrowValue.toNumber() / (collateralAmount * effectiveThreshold * Math.pow(10, 8));
   }
 
   private assessLiquidationRisk(healthFactor: number): 'safe' | 'warning' | 'danger' | 'liquidatable' {
     if (healthFactor < 1.0) return 'liquidatable';
-    if (healthFactor < 1.1) return 'danger';
-    if (healthFactor < 1.25) return 'warning';
+    if (healthFactor < 1.05) return 'danger';
+    if (healthFactor < 1.15) return 'warning';
     return 'safe';
+  }
+
+  async getLiquidationThresholdBreakdown(obligation: KaminoObligation): Promise<LiquidationThresholdBreakdown> {
+    const perAsset: Array<{
+      mint: PublicKey;
+      depositValue: BN;
+      liquidationThreshold: number;
+      contribution: number;
+    }> = [];
+
+    let totalValue = new BN(0);
+    let weightedThreshold = 0;
+
+    for (const deposit of obligation.deposits) {
+      const reserve = this.reserves.get(deposit.depositReserve.toBase58());
+      if (!reserve) continue;
+
+      const value = deposit.marketValue;
+      totalValue = totalValue.add(value);
+
+      const threshold = reserve.config.liquidationThreshold;
+      const contribution = value.toNumber() / obligation.depositedValue.toNumber();
+
+      perAsset.push({
+        mint: reserve.mintAddress,
+        depositValue: value,
+        liquidationThreshold: threshold,
+        contribution,
+      });
+
+      weightedThreshold += threshold * contribution;
+    }
+
+    const effective = obligation.effectiveLiquidationThreshold;
+    const buffer = effective.mul(obligation.depositedValue).div(new BN(PERCENT_SCALE)).sub(obligation.borrowedValue);
+
+    return {
+      perAsset,
+      weighted: weightedThreshold,
+      effective,
+      buffer,
+    };
   }
 
   async getHealthFactor(obligation: KaminoObligation): Promise<number> {
@@ -388,6 +528,14 @@ export class KaminoMonitor {
 
   async getLTV(obligation: KaminoObligation): Promise<number> {
     return obligation.calculatedLtv;
+  }
+
+  async getPreciseLTV(obligation: KaminoObligation): Promise<BN> {
+    return obligation.preciseLtv;
+  }
+
+  async getPreciseHealthFactor(obligation: KaminoObligation): Promise<BN> {
+    return obligation.preciseHealthFactor;
   }
 
   async getLiquidationPrice(obligation: KaminoObligation, collateralMint: PublicKey): Promise<number> {
@@ -406,16 +554,18 @@ export class KaminoMonitor {
     );
 
     const liquidationThreshold = reserve.config.liquidationThreshold;
-    const collateralAmount = collateralDeposit.depositedAmount.toNumber() / 
+    const liquidationBonus = reserve.config.liquidationBonus;
+    const collateralAmount = collateralDeposit.actualDepositAmount.toNumber() / 
       Math.pow(10, reserve.liquidity.mintDecimals);
 
     if (collateralAmount === 0) return 0;
 
-    return totalBorrowValue.toNumber() / (collateralAmount * liquidationThreshold * Math.pow(10, 8));
+    const effectiveThreshold = liquidationThreshold * (1 - liquidationBonus);
+    return totalBorrowValue.toNumber() / (collateralAmount * effectiveThreshold * Math.pow(10, 8));
   }
 
   async isObligationLiquidatable(obligation: KaminoObligation): Promise<boolean> {
-    return obligation.calculatedHealthFactor < 1.0;
+    return obligation.preciseHealthFactor.lt(PRECISION_FACTOR);
   }
 
   async calculateMaxBorrowAmount(obligation: KaminoObligation): Promise<BN> {
@@ -426,16 +576,76 @@ export class KaminoMonitor {
       if (!reserve) continue;
 
       const ltv = reserve.config.loanToValueRatio;
-      const borrowPower = deposit.marketValue.muln(ltv * 100).divn(100);
+      const borrowPower = deposit.marketValue.muln(Math.floor(ltv * PERCENT_SCALE)).divn(PERCENT_SCALE);
       maxBorrowValue = maxBorrowValue.add(borrowPower);
     }
 
-    return maxBorrowValue.sub(obligation.borrowedValue);
+    const remaining = maxBorrowValue.sub(obligation.borrowedValue);
+    return remaining.isNeg() ? new BN(0) : remaining;
   }
 
   async getUtilizationRatio(obligation: KaminoObligation): Promise<number> {
-    if (obligation.depositedValue.isZero()) return 0;
-    return obligation.borrowedValue.toNumber() / obligation.depositedValue.toNumber();
+    return obligation.borrowUtilization;
+  }
+
+  async getBorrowCapacityRemaining(obligation: KaminoObligation): Promise<BN> {
+    return await this.calculateMaxBorrowAmount(obligation);
+  }
+
+  async getLiquidationBuffer(obligation: KaminoObligation): Promise<BN> {
+    const liquidationValue = obligation.effectiveLiquidationThreshold
+      .mul(obligation.depositedValue)
+      .div(new BN(PERCENT_SCALE));
+    
+    const buffer = liquidationValue.sub(obligation.borrowedValue);
+    return buffer.isNeg() ? new BN(0) : buffer;
+  }
+
+  async calculateLiquidationImpact(obligation: KaminoObligation, assetMint: PublicKey): Promise<{
+    liquidationValue: BN;
+    bonusReceived: BN;
+    collateralSeized: BN;
+    remainingCollateral: BN;
+  }> {
+    const deposit = obligation.deposits.find(d => {
+      const reserve = this.reserves.get(d.depositReserve.toBase58());
+      return reserve?.mintAddress.equals(assetMint);
+    });
+
+    if (!deposit) {
+      return {
+        liquidationValue: new BN(0),
+        bonusReceived: new BN(0),
+        collateralSeized: new BN(0),
+        remainingCollateral: new BN(0),
+      };
+    }
+
+    const reserve = this.reserves.get(deposit.depositReserve.toBase58());
+    if (!reserve) {
+      return {
+        liquidationValue: new BN(0),
+        bonusReceived: new BN(0),
+        collateralSeized: new BN(0),
+        remainingCollateral: new BN(0),
+      };
+    }
+
+    const maxLiquidationValue = obligation.borrowedValue.muln(50).divn(100);
+    const liquidationValue = BN.min(deposit.marketValue, maxLiquidationValue);
+    
+    const liquidationBonus = reserve.config.liquidationBonus;
+    const bonusReceived = liquidationValue.muln(Math.floor(liquidationBonus * PERCENT_SCALE)).divn(PERCENT_SCALE);
+    
+    const collateralSeized = liquidationValue.add(bonusReceived);
+    const remainingCollateral = deposit.marketValue.sub(collateralSeized);
+
+    return {
+      liquidationValue,
+      bonusReceived,
+      collateralSeized,
+      remainingCollateral,
+    };
   }
 
   getReserve(address: PublicKey): KaminoReserve | undefined {
@@ -472,5 +682,31 @@ export class KaminoMonitor {
 
   getActiveReserves(): KaminoReserve[] {
     return this.getAllReserves().filter(reserve => reserve.isActive);
+  }
+
+  async getObligationsAtRisk(healthFactorThreshold: number = 1.2): Promise<KaminoObligation[]> {
+    const allObligations: KaminoObligation[] = [];
+    
+    try {
+      const accounts = await this.connection.getProgramAccounts(KAMINO_PROGRAM_ID, {
+        filters: [{ dataSize: 1300 }]
+      });
+
+      for (const acc of accounts) {
+        try {
+          const obligation = await this.parseObligation(acc.pubkey, acc.account.data);
+          if ((obligation.depositsLen > 0 || obligation.borrowsLen > 0) && 
+              obligation.calculatedHealthFactor < healthFactorThreshold) {
+            allObligations.push(obligation);
+          }
+        } catch (error) {
+          console.warn(`[KAMINO] Failed to parse obligation ${acc.pubkey.toBase58()}:`, error);
+        }
+      }
+    } catch (error) {
+      console.error('[KAMINO] Error fetching at-risk obligations:', error);
+    }
+
+    return allObligations.sort((a, b) => a.calculatedHealthFactor - b.calculatedHealthFactor);
   }
 }
