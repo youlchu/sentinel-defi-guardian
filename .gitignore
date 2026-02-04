@@ -21,6 +21,7 @@ Thumbs.db
 
 # Logs
 *.log
+logs/*.json
 npm-debug.log*
 
 # Test coverage
@@ -29,3 +30,6 @@ coverage/
 # Temporary files
 *.tmp
 *.temp
+
+# Backup files (created by agent)
+*.backup
