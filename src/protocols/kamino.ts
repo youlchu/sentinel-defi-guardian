@@ -4,6 +4,9 @@ import { BorshAccountsCoder, BN } from '@coral-xyz/anchor';
 export const KAMINO_PROGRAM_ID = new PublicKey('KLend2g3cP87ber41aPn9Q5kkdCZNxMWTKZLGvBKgvV');
 export const KAMINO_LENDING_MARKET = new PublicKey('7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF');
 
+const WAD = new BN('1000000000000000000'); // 18 decimals
+const PERCENT_SCALE = 10000;
+
 export interface KaminoReserve {
   address: PublicKey;
   mintAddress: PublicKey;
@@ -31,6 +34,8 @@ export interface KaminoReserve {
     cumulativeBorrowRateWads: BN;
     marketPrice: BN;
   };
+  lastUpdatedSlot: BN;
+  isActive: boolean;
 }
 
 export interface KaminoObligation {
@@ -49,6 +54,9 @@ export interface KaminoObligation {
     slot: BN;
     stale: boolean;
   };
+  calculatedLtv: number;
+  calculatedHealthFactor: number;
+  liquidationRisk: 'safe' | 'warning' | 'danger' | 'liquidatable';
 }
 
 export interface KaminoDeposit {
@@ -56,6 +64,7 @@ export interface KaminoDeposit {
   depositedAmount: BN;
   marketValue: BN;
   attributedBorrowValue: BN;
+  cumulativeDepositRateWads: BN;
 }
 
 export interface KaminoBorrow {
@@ -63,11 +72,25 @@ export interface KaminoBorrow {
   borrowedAmountWads: BN;
   cumulativeBorrowRateWads: BN;
   marketValue: BN;
+  borrowedAmount: BN;
+}
+
+export interface ObligationCalculations {
+  totalDepositedValue: BN;
+  totalBorrowedValue: BN;
+  weightedLtv: number;
+  healthFactor: number;
+  liquidationThreshold: number;
+  maxBorrowValue: BN;
+  liquidationPrice: number;
+  isLiquidatable: boolean;
+  utilizationRatio: number;
 }
 
 export class KaminoMonitor {
   private connection: Connection;
   private reserves: Map<string, KaminoReserve> = new Map();
+  private priceCache: Map<string, { price: BN; timestamp: number }> = new Map();
 
   constructor(connection: Connection) {
     this.connection = connection;
@@ -77,14 +100,18 @@ export class KaminoMonitor {
     try {
       const accounts = await this.connection.getProgramAccounts(KAMINO_PROGRAM_ID, {
         filters: [
-          { dataSize: 619 }, // Reserve account size
+          { dataSize: 1304 },
           { memcmp: { offset: 8, bytes: KAMINO_LENDING_MARKET.toBase58() } }
         ]
       });
 
       for (const account of accounts) {
-        const reserve = this.parseReserve(account.pubkey, account.account.data);
-        this.reserves.set(account.pubkey.toBase58(), reserve);
+        try {
+          const reserve = this.parseReserve(account.pubkey, account.account.data);
+          this.reserves.set(account.pubkey.toBase58(), reserve);
+        } catch (error) {
+          console.warn(`[KAMINO] Failed to parse reserve ${account.pubkey.toBase58()}:`, error);
+        }
       }
 
       console.log(`[KAMINO] Loaded ${this.reserves.size} reserves`);
@@ -94,54 +121,71 @@ export class KaminoMonitor {
   }
 
   private parseReserve(address: PublicKey, data: Buffer): KaminoReserve {
-    const lendingMarket = new PublicKey(data.slice(8, 40));
-    const mintAddress = new PublicKey(data.slice(40, 72));
-    const liquiditySupply = new BN(data.slice(72, 80), 'le');
-    const borrowedLiquidity = new BN(data.slice(80, 88), 'le');
-    
-    const loanToValueRatio = data.readUInt8(264);
-    const liquidationThreshold = data.readUInt8(265);
-    const liquidationBonus = data.readUInt8(266);
-    
-    const liquidityMintPubkey = new PublicKey(data.slice(296, 328));
-    const liquidityMintDecimals = data.readUInt8(328);
-    const liquiditySupplyPubkey = new PublicKey(data.slice(329, 361));
-    const pythOracle = new PublicKey(data.slice(361, 393));
-    const switchboardOracle = new PublicKey(data.slice(393, 425));
-    
-    const availableAmount = new BN(data.slice(425, 433), 'le');
-    const borrowedAmountWads = new BN(data.slice(433, 449), 'le');
-    const cumulativeBorrowRateWads = new BN(data.slice(449, 465), 'le');
-    const marketPrice = new BN(data.slice(465, 481), 'le');
+    try {
+      const lendingMarket = new PublicKey(data.subarray(8, 40));
+      const mintAddress = new PublicKey(data.subarray(40, 72));
+      
+      const liquiditySupply = new BN(data.subarray(72, 80), 'le');
+      const borrowedLiquidity = new BN(data.subarray(80, 88), 'le');
+      const liquidityFeeReceiver = new PublicKey(data.subarray(88, 120));
+      
+      const borrowFeeWad = new BN(data.subarray(120, 136), 'le');
+      const flashLoanFeeWad = new BN(data.subarray(136, 152), 'le');
+      const hostFeePercentage = data.readUInt8(152);
+      const depositLimit = new BN(data.subarray(153, 161), 'le');
+      const borrowLimit = new BN(data.subarray(161, 169), 'le');
+      
+      const loanToValueRatio = data.readUInt16LE(264) / PERCENT_SCALE;
+      const liquidationThreshold = data.readUInt16LE(266) / PERCENT_SCALE;
+      const liquidationBonus = data.readUInt16LE(268) / PERCENT_SCALE;
+      
+      const liquidityMintPubkey = new PublicKey(data.subarray(296, 328));
+      const liquidityMintDecimals = data.readUInt8(328);
+      const liquiditySupplyPubkey = new PublicKey(data.subarray(329, 361));
+      const pythOracle = new PublicKey(data.subarray(361, 393));
+      const switchboardOracle = new PublicKey(data.subarray(393, 425));
+      
+      const availableAmount = new BN(data.subarray(425, 433), 'le');
+      const borrowedAmountWads = new BN(data.subarray(433, 449), 'le');
+      const cumulativeBorrowRateWads = new BN(data.subarray(449, 465), 'le');
+      const marketPrice = new BN(data.subarray(465, 481), 'le');
+      
+      const lastUpdatedSlot = new BN(data.subarray(481, 489), 'le');
+      const isActive = data.readUInt8(489) === 1;
 
-    return {
-      address,
-      mintAddress,
-      liquiditySupply,
-      borrowedLiquidity,
-      liquidityFeeReceiver: new PublicKey(data.slice(88, 120)),
-      config: {
-        loanToValueRatio: loanToValueRatio / 100,
-        liquidationThreshold: liquidationThreshold / 100,
-        liquidationBonus: liquidationBonus / 100,
-        borrowFeeWad: new BN(data.slice(120, 136), 'le'),
-        flashLoanFeeWad: new BN(data.slice(136, 152), 'le'),
-        hostFeePercentage: data.readUInt8(152),
-        depositLimit: new BN(data.slice(153, 161), 'le'),
-        borrowLimit: new BN(data.slice(161, 169), 'le'),
-      },
-      liquidity: {
-        mintPubkey: liquidityMintPubkey,
-        mintDecimals: liquidityMintDecimals,
-        supplyPubkey: liquiditySupplyPubkey,
-        pythOracle,
-        switchboardOracle,
-        availableAmount,
-        borrowedAmountWads,
-        cumulativeBorrowRateWads,
-        marketPrice,
-      }
-    };
+      return {
+        address,
+        mintAddress,
+        liquiditySupply,
+        borrowedLiquidity,
+        liquidityFeeReceiver,
+        config: {
+          loanToValueRatio,
+          liquidationThreshold,
+          liquidationBonus,
+          borrowFeeWad,
+          flashLoanFeeWad,
+          hostFeePercentage,
+          depositLimit,
+          borrowLimit,
+        },
+        liquidity: {
+          mintPubkey: liquidityMintPubkey,
+          mintDecimals: liquidityMintDecimals,
+          supplyPubkey: liquiditySupplyPubkey,
+          pythOracle,
+          switchboardOracle,
+          availableAmount,
+          borrowedAmountWads,
+          cumulativeBorrowRateWads,
+          marketPrice,
+        },
+        lastUpdatedSlot,
+        isActive
+      };
+    } catch (error) {
+      throw new Error(`Failed to parse reserve data: ${error}`);
+    }
   }
 
   async getObligationsByOwner(owner: PublicKey): Promise<KaminoObligation[]> {
@@ -150,107 +194,248 @@ export class KaminoMonitor {
     try {
       const accounts = await this.connection.getProgramAccounts(KAMINO_PROGRAM_ID, {
         filters: [
-          { dataSize: 1300 }, // Obligation account size
+          { dataSize: 1300 },
           { memcmp: { offset: 40, bytes: owner.toBase58() } }
         ]
       });
 
-      const obligations = accounts.map(acc => this.parseObligation(acc.pubkey, acc.account.data));
-      return obligations.filter(o => o.depositsLen > 0 || o.borrowsLen > 0);
+      const obligations: KaminoObligation[] = [];
+      for (const acc of accounts) {
+        try {
+          const obligation = await this.parseObligation(acc.pubkey, acc.account.data);
+          if (obligation.depositsLen > 0 || obligation.borrowsLen > 0) {
+            obligations.push(obligation);
+          }
+        } catch (error) {
+          console.warn(`[KAMINO] Failed to parse obligation ${acc.pubkey.toBase58()}:`, error);
+        }
+      }
+
+      return obligations;
     } catch (error) {
       console.error('[KAMINO] Error fetching obligations:', error);
       return [];
     }
   }
 
-  private parseObligation(address: PublicKey, data: Buffer): KaminoObligation {
-    const lendingMarket = new PublicKey(data.slice(8, 40));
-    const owner = new PublicKey(data.slice(40, 72));
-    
-    const depositedValue = new BN(data.slice(72, 88), 'le');
-    const borrowedValue = new BN(data.slice(88, 104), 'le');
-    const allowedBorrowValue = new BN(data.slice(104, 120), 'le');
-    const unhealthyBorrowValue = new BN(data.slice(120, 136), 'le');
-    
-    const depositsLen = data.readUInt8(136);
-    const borrowsLen = data.readUInt8(137);
-    
-    const lastUpdateSlot = new BN(data.slice(138, 146), 'le');
-    const lastUpdateStale = data.readUInt8(146) === 1;
+  private async parseObligation(address: PublicKey, data: Buffer): Promise<KaminoObligation> {
+    try {
+      const lendingMarket = new PublicKey(data.subarray(8, 40));
+      const owner = new PublicKey(data.subarray(40, 72));
+      
+      const depositedValue = new BN(data.subarray(72, 88), 'le');
+      const borrowedValue = new BN(data.subarray(88, 104), 'le');
+      const allowedBorrowValue = new BN(data.subarray(104, 120), 'le');
+      const unhealthyBorrowValue = new BN(data.subarray(120, 136), 'le');
+      
+      const depositsLen = data.readUInt8(136);
+      const borrowsLen = data.readUInt8(137);
+      
+      const lastUpdateSlot = new BN(data.subarray(138, 146), 'le');
+      const lastUpdateStale = data.readUInt8(146) === 1;
 
-    const deposits: KaminoDeposit[] = [];
-    for (let i = 0; i < depositsLen && i < 8; i++) {
-      const offset = 200 + i * 48;
-      deposits.push({
-        depositReserve: new PublicKey(data.slice(offset, offset + 32)),
-        depositedAmount: new BN(data.slice(offset + 32, offset + 40), 'le'),
-        marketValue: new BN(data.slice(offset + 40, offset + 48), 'le'),
-        attributedBorrowValue: new BN(0),
-      });
+      const deposits: KaminoDeposit[] = [];
+      for (let i = 0; i < Math.min(depositsLen, 8); i++) {
+        const offset = 200 + i * 56;
+        deposits.push({
+          depositReserve: new PublicKey(data.subarray(offset, offset + 32)),
+          depositedAmount: new BN(data.subarray(offset + 32, offset + 40), 'le'),
+          marketValue: new BN(data.subarray(offset + 40, offset + 48), 'le'),
+          attributedBorrowValue: new BN(data.subarray(offset + 48, offset + 56), 'le'),
+          cumulativeDepositRateWads: new BN(data.subarray(offset + 56, offset + 72), 'le'),
+        });
+      }
+
+      const borrows: KaminoBorrow[] = [];
+      for (let i = 0; i < Math.min(borrowsLen, 8); i++) {
+        const offset = 648 + i * 72;
+        const borrowReserve = new PublicKey(data.subarray(offset, offset + 32));
+        const borrowedAmountWads = new BN(data.subarray(offset + 32, offset + 48), 'le');
+        const cumulativeBorrowRateWads = new BN(data.subarray(offset + 48, offset + 64), 'le');
+        const marketValue = new BN(data.subarray(offset + 64, offset + 72), 'le');
+        
+        const reserve = this.reserves.get(borrowReserve.toBase58());
+        const borrowedAmount = reserve ? 
+          borrowedAmountWads.div(reserve.liquidity.cumulativeBorrowRateWads) : 
+          new BN(0);
+
+        borrows.push({
+          borrowReserve,
+          borrowedAmountWads,
+          cumulativeBorrowRateWads,
+          marketValue,
+          borrowedAmount,
+        });
+      }
+
+      const calculations = await this.calculateObligationMetrics(deposits, borrows);
+
+      return {
+        address,
+        owner,
+        lendingMarket,
+        deposits,
+        borrows,
+        depositedValue,
+        borrowedValue,
+        allowedBorrowValue,
+        unhealthyBorrowValue,
+        depositsLen,
+        borrowsLen,
+        lastUpdate: {
+          slot: lastUpdateSlot,
+          stale: lastUpdateStale,
+        },
+        calculatedLtv: calculations.weightedLtv,
+        calculatedHealthFactor: calculations.healthFactor,
+        liquidationRisk: this.assessLiquidationRisk(calculations.healthFactor),
+      };
+    } catch (error) {
+      throw new Error(`Failed to parse obligation data: ${error}`);
+    }
+  }
+
+  private async calculateObligationMetrics(
+    deposits: KaminoDeposit[],
+    borrows: KaminoBorrow[]
+  ): Promise<ObligationCalculations> {
+    let totalDepositedValue = new BN(0);
+    let totalBorrowedValue = new BN(0);
+    let weightedLtvSum = 0;
+    let maxBorrowValue = new BN(0);
+    let liquidationThresholdSum = 0;
+
+    for (const deposit of deposits) {
+      const reserve = this.reserves.get(deposit.depositReserve.toBase58());
+      if (!reserve) continue;
+
+      const depositValue = deposit.marketValue;
+      totalDepositedValue = totalDepositedValue.add(depositValue);
+
+      const ltv = reserve.config.loanToValueRatio;
+      const liquidationThreshold = reserve.config.liquidationThreshold;
+      
+      const depositValueNum = depositValue.toNumber();
+      weightedLtvSum += ltv * depositValueNum;
+      liquidationThresholdSum += liquidationThreshold * depositValueNum;
+      
+      const borrowPower = depositValue.muln(ltv * 100).divn(100);
+      maxBorrowValue = maxBorrowValue.add(borrowPower);
     }
 
-    const borrows: KaminoBorrow[] = [];
-    for (let i = 0; i < borrowsLen && i < 8; i++) {
-      const offset = 584 + i * 56;
-      borrows.push({
-        borrowReserve: new PublicKey(data.slice(offset, offset + 32)),
-        borrowedAmountWads: new BN(data.slice(offset + 32, offset + 48), 'le'),
-        cumulativeBorrowRateWads: new BN(data.slice(offset + 48, offset + 56), 'le'),
-        marketValue: new BN(0),
-      });
+    for (const borrow of borrows) {
+      totalBorrowedValue = totalBorrowedValue.add(borrow.marketValue);
     }
+
+    const totalDepositedValueNum = totalDepositedValue.toNumber();
+    const weightedLtv = totalDepositedValueNum > 0 ? weightedLtvSum / totalDepositedValueNum : 0;
+    const liquidationThreshold = totalDepositedValueNum > 0 ? liquidationThresholdSum / totalDepositedValueNum : 0;
+
+    const healthFactor = totalBorrowedValue.isZero() ? 
+      Infinity : 
+      (liquidationThreshold * totalDepositedValueNum) / totalBorrowedValue.toNumber();
+
+    const utilizationRatio = totalDepositedValue.isZero() ? 
+      0 : 
+      totalBorrowedValue.toNumber() / totalDepositedValue.toNumber();
 
     return {
-      address,
-      owner,
-      lendingMarket,
-      deposits,
-      borrows,
-      depositedValue,
-      borrowedValue,
-      allowedBorrowValue,
-      unhealthyBorrowValue,
-      depositsLen,
-      borrowsLen,
-      lastUpdate: {
-        slot: lastUpdateSlot,
-        stale: lastUpdateStale,
-      }
+      totalDepositedValue,
+      totalBorrowedValue,
+      weightedLtv,
+      healthFactor,
+      liquidationThreshold,
+      maxBorrowValue,
+      liquidationPrice: this.calculateLiquidationPrice(deposits, borrows),
+      isLiquidatable: healthFactor < 1.0,
+      utilizationRatio,
     };
   }
 
+  private calculateLiquidationPrice(deposits: KaminoDeposit[], borrows: KaminoBorrow[]): number {
+    if (deposits.length === 0 || borrows.length === 0) return 0;
+
+    const largestDeposit = deposits.reduce((max, deposit) => 
+      deposit.marketValue.gt(max.marketValue) ? deposit : max
+    );
+
+    const reserve = this.reserves.get(largestDeposit.depositReserve.toBase58());
+    if (!reserve) return 0;
+
+    const totalBorrowValue = borrows.reduce((sum, borrow) => 
+      sum.add(borrow.marketValue), new BN(0)
+    );
+
+    const liquidationThreshold = reserve.config.liquidationThreshold;
+    const collateralAmount = largestDeposit.depositedAmount.toNumber() / 
+      Math.pow(10, reserve.liquidity.mintDecimals);
+
+    if (collateralAmount === 0) return 0;
+
+    return totalBorrowValue.toNumber() / (collateralAmount * liquidationThreshold * Math.pow(10, 8));
+  }
+
+  private assessLiquidationRisk(healthFactor: number): 'safe' | 'warning' | 'danger' | 'liquidatable' {
+    if (healthFactor < 1.0) return 'liquidatable';
+    if (healthFactor < 1.1) return 'danger';
+    if (healthFactor < 1.25) return 'warning';
+    return 'safe';
+  }
+
   async getHealthFactor(obligation: KaminoObligation): Promise<number> {
-    if (obligation.borrowedValue.isZero()) return Infinity;
-    
-    return obligation.unhealthyBorrowValue.toNumber() / obligation.borrowedValue.toNumber();
+    return obligation.calculatedHealthFactor;
   }
 
   async getLTV(obligation: KaminoObligation): Promise<number> {
-    if (obligation.depositedValue.isZero()) return 0;
-    
-    return obligation.borrowedValue.toNumber() / obligation.depositedValue.toNumber();
+    return obligation.calculatedLtv;
   }
 
   async getLiquidationPrice(obligation: KaminoObligation, collateralMint: PublicKey): Promise<number> {
-    if (obligation.deposits.length === 0 || obligation.borrows.length === 0) {
-      return 0;
-    }
-
     const collateralDeposit = obligation.deposits.find(d => {
       const reserve = this.reserves.get(d.depositReserve.toBase58());
       return reserve?.mintAddress.equals(collateralMint);
     });
 
-    if (!collateralDeposit) return 0;
+    if (!collateralDeposit || obligation.borrows.length === 0) return 0;
 
     const reserve = this.reserves.get(collateralDeposit.depositReserve.toBase58());
     if (!reserve) return 0;
 
+    const totalBorrowValue = obligation.borrows.reduce((sum, borrow) => 
+      sum.add(borrow.marketValue), new BN(0)
+    );
+
     const liquidationThreshold = reserve.config.liquidationThreshold;
-    const borrowValue = obligation.borrowedValue.toNumber() / Math.pow(10, 8);
-    const collateralAmount = collateralDeposit.depositedAmount.toNumber() / Math.pow(10, reserve.liquidity.mintDecimals);
-    
-    return borrowValue / (collateralAmount * liquidationThreshold);
+    const collateralAmount = collateralDeposit.depositedAmount.toNumber() / 
+      Math.pow(10, reserve.liquidity.mintDecimals);
+
+    if (collateralAmount === 0) return 0;
+
+    return totalBorrowValue.toNumber() / (collateralAmount * liquidationThreshold * Math.pow(10, 8));
+  }
+
+  async isObligationLiquidatable(obligation: KaminoObligation): Promise<boolean> {
+    return obligation.calculatedHealthFactor < 1.0;
+  }
+
+  async calculateMaxBorrowAmount(obligation: KaminoObligation): Promise<BN> {
+    let maxBorrowValue = new BN(0);
+
+    for (const deposit of obligation.deposits) {
+      const reserve = this.reserves.get(deposit.depositReserve.toBase58());
+      if (!reserve) continue;
+
+      const ltv = reserve.config.loanToValueRatio;
+      const borrowPower = deposit.marketValue.muln(ltv * 100).divn(100);
+      maxBorrowValue = maxBorrowValue.add(borrowPower);
+    }
+
+    return maxBorrowValue.sub(obligation.borrowedValue);
+  }
+
+  async getUtilizationRatio(obligation: KaminoObligation): Promise<number> {
+    if (obligation.depositedValue.isZero()) return 0;
+    return obligation.borrowedValue.toNumber() / obligation.depositedValue.toNumber();
   }
 
   getReserve(address: PublicKey): KaminoReserve | undefined {
@@ -262,10 +447,30 @@ export class KaminoMonitor {
       const accountInfo = await this.connection.getAccountInfo(obligation.address);
       if (!accountInfo?.data) return;
 
-      const updatedObligation = this.parseObligation(obligation.address, accountInfo.data);
+      const updatedObligation = await this.parseObligation(obligation.address, accountInfo.data);
       Object.assign(obligation, updatedObligation);
     } catch (error) {
       console.error(`[KAMINO] Error refreshing obligation ${obligation.address.toBase58()}:`, error);
     }
+  }
+
+  async refreshReserve(reserveAddress: PublicKey): Promise<void> {
+    try {
+      const accountInfo = await this.connection.getAccountInfo(reserveAddress);
+      if (!accountInfo?.data) return;
+
+      const updatedReserve = this.parseReserve(reserveAddress, accountInfo.data);
+      this.reserves.set(reserveAddress.toBase58(), updatedReserve);
+    } catch (error) {
+      console.error(`[KAMINO] Error refreshing reserve ${reserveAddress.toBase58()}:`, error);
+    }
+  }
+
+  getAllReserves(): KaminoReserve[] {
+    return Array.from(this.reserves.values());
+  }
+
+  getActiveReserves(): KaminoReserve[] {
+    return this.getAllReserves().filter(reserve => reserve.isActive);
   }
 }
