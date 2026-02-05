@@ -150,6 +150,13 @@ export class DriftMonitor {
     this.connection = connection;
   }
 
+  private readI128(buffer: Buffer, offset: number): number {
+    const low = buffer.readBigUInt64LE(offset);
+    const high = buffer.readBigInt64LE(offset + 8);
+    const value = (high << 64n) | low;
+    return Number(value);
+  }
+
   async getUsersByAuthority(authority: PublicKey): Promise<DriftUser[]> {
     console.log(`[DRIFT] Fetching users for ${authority.toBase58()}`);
 
@@ -444,16 +451,16 @@ export class DriftMonitor {
   private parseAmm(data: Buffer, startOffset: number): AmmData {
     let offset = startOffset;
     
-    const baseAssetReserve = data.readBigUInt64LE(offset) / 1e9;
+    const baseAssetReserve = Number(data.readBigUInt64LE(offset)) / 1e9;
     offset += 8;
     
-    const quoteAssetReserve = data.readBigUInt64LE(offset) / 1e6;
+    const quoteAssetReserve = Number(data.readBigUInt64LE(offset)) / 1e6;
     offset += 8;
     
     const sqrtK = data.readBigUInt64LE(offset);
     offset += 8;
     
-    const pegMultiplier = data.readBigUInt64LE(offset) / 1e6;
+    const pegMultiplier = Number(data.readBigUInt64LE(offset)) / 1e6;
     offset += 8;
     
     const totalFeeMinusDistributions = this.readI128(data, offset) / 1e6;
@@ -767,12 +774,7 @@ export class DriftMonitor {
     const market = await this.getMarket(marketIndex);
     if (!market) return null;
     
-    const hourlyFundingRate = this.calculateHourlyFundingRate(
-      market.cumulativeFundingRateLong,
-      market.cumulativeFundingRateShort,
-      market.fundingPeriod
-    );
-    
+    const hourlyFundingRate = Number(market.cumulativeFundingRateLong - market.cumulativeFundingRateShort) / (2 * market.fundingPeriod / 3600);
     const annualizedFundingRate = hourlyFundingRate * 24 * 365;
     const twapSpread = market.amm.lastMarkPriceTwap - market.amm.lastOraclePrice;
     
@@ -780,9 +782,5 @@ export class DriftMonitor {
       marketIndex,
       fundingRate: (market.cumulativeFundingRateLong + market.cumulativeFundingRateShort) / 2,
       fundingRateHourly: hourlyFundingRate,
-      fundingRateAnnualized: annualizedFundingRate,
-      cumulativeFundingRateLong: market.cumulativeFundingRateLong,
-      cumulativeFundingRateShort: market.cumulativeFundingRateShort,
-      timestamp: market.lastFundingRateTs,
-      nextFunding
+      fundingRateAnnualized: annualizedF
 }}}
