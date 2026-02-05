@@ -243,6 +243,249 @@ export class RiskEngine {
     };
   }
 
+  private async calculateTechnicalIndicators(position: Position): Promise<{
+    rsi: number;
+    macd: {
+      macd: number;
+      signal: number;
+      histogram: number;
+    };
+    stochastic: {
+      k: number;
+      d: number;
+    };
+    atr: number;
+  }> {
+    if (position.collateral.length === 0) {
+      return {
+        rsi: 50,
+        macd: { macd: 0, signal: 0, histogram: 0 },
+        stochastic: { k: 50, d: 50 },
+        atr: 0
+      };
+    }
+
+    const mintAddress = position.collateral[0].mint.toBase58();
+    const priceData = this.historicalData.get(mintAddress) || [];
+
+    if (priceData.length < 14) {
+      return {
+        rsi: 50,
+        macd: { macd: 0, signal: 0, histogram: 0 },
+        stochastic: { k: 50, d: 50 },
+        atr: 0
+      };
+    }
+
+    const prices = priceData.map(d => d.price);
+    const highs = priceData.map(d => d.high);
+    const lows = priceData.map(d => d.low);
+
+    const rsi = this.calculateRSI(prices, 14);
+    const macd = this.calculateMACD(prices);
+    const stochastic = this.calculateStochastic(highs, lows, prices, 14, 3);
+    const atr = this.calculateATR(highs, lows, prices, 14);
+
+    return { rsi, macd, stochastic, atr };
+  }
+
+  private calculateRSI(prices: number[], period: number): number {
+    if (prices.length < period + 1) return 50;
+
+    let gains = 0;
+    let losses = 0;
+
+    for (let i = 1; i <= period; i++) {
+      const change = prices[i] - prices[i - 1];
+      if (change > 0) gains += change;
+      else losses -= change;
+    }
+
+    let avgGain = gains / period;
+    let avgLoss = losses / period;
+
+    for (let i = period + 1; i < prices.length; i++) {
+      const change = prices[i] - prices[i - 1];
+      if (change > 0) {
+        avgGain = (avgGain * (period - 1) + change) / period;
+        avgLoss = (avgLoss * (period - 1)) / period;
+      } else {
+        avgGain = (avgGain * (period - 1)) / period;
+        avgLoss = (avgLoss * (period - 1) - change) / period;
+      }
+    }
+
+    if (avgLoss === 0) return 100;
+    const rs = avgGain / avgLoss;
+    return 100 - (100 / (1 + rs));
+  }
+
+  private calculateMACD(prices: number[]): { macd: number; signal: number; histogram: number } {
+    if (prices.length < 26) {
+      return { macd: 0, signal: 0, histogram: 0 };
+    }
+
+    const ema12 = this.calculateEMA(prices, 12);
+    const ema26 = this.calculateEMA(prices, 26);
+    const macd = ema12 - ema26;
+
+    const macdLine = [];
+    for (let i = 25; i < prices.length; i++) {
+      const ema12Val = this.calculateEMAAtIndex(prices, 12, i);
+      const ema26Val = this.calculateEMAAtIndex(prices, 26, i);
+      macdLine.push(ema12Val - ema26Val);
+    }
+
+    const signal = this.calculateEMA(macdLine, 9);
+    const histogram = macd - signal;
+
+    return { macd, signal, histogram };
+  }
+
+  private calculateEMA(data: number[], period: number): number {
+    if (data.length === 0) return 0;
+    if (data.length < period) return data[data.length - 1];
+
+    const multiplier = 2 / (period + 1);
+    let ema = data[0];
+
+    for (let i = 1; i < data.length; i++) {
+      ema = (data[i] * multiplier) + (ema * (1 - multiplier));
+    }
+
+    return ema;
+  }
+
+  private calculateEMAAtIndex(data: number[], period: number, index: number): number {
+    if (index >= data.length || index < 0) return 0;
+    
+    const multiplier = 2 / (period + 1);
+    let ema = data[0];
+
+    for (let i = 1; i <= index; i++) {
+      ema = (data[i] * multiplier) + (ema * (1 - multiplier));
+    }
+
+    return ema;
+  }
+
+  private calculateStochastic(highs: number[], lows: number[], closes: number[], kPeriod: number, dPeriod: number): { k: number; d: number } {
+    if (highs.length < kPeriod || lows.length < kPeriod || closes.length < kPeriod) {
+      return { k: 50, d: 50 };
+    }
+
+    const kValues = [];
+
+    for (let i = kPeriod - 1; i < closes.length; i++) {
+      const highestHigh = Math.max(...highs.slice(i - kPeriod + 1, i + 1));
+      const lowestLow = Math.min(...lows.slice(i - kPeriod + 1, i + 1));
+      const currentClose = closes[i];
+
+      if (highestHigh === lowestLow) {
+        kValues.push(50);
+      } else {
+        const k = ((currentClose - lowestLow) / (highestHigh - lowestLow)) * 100;
+        kValues.push(k);
+      }
+    }
+
+    const currentK = kValues[kValues.length - 1] || 50;
+    const d = kValues.length >= dPeriod 
+      ? kValues.slice(-dPeriod).reduce((a, b) => a + b, 0) / dPeriod
+      : currentK;
+
+    return { k: currentK, d };
+  }
+
+  private calculateATR(highs: number[], lows: number[], closes: number[], period: number): number {
+    if (highs.length < period + 1 || lows.length < period + 1 || closes.length < period + 1) {
+      return 0;
+    }
+
+    const trueRanges = [];
+
+    for (let i = 1; i < closes.length; i++) {
+      const tr1 = highs[i] - lows[i];
+      const tr2 = Math.abs(highs[i] - closes[i - 1]);
+      const tr3 = Math.abs(lows[i] - closes[i - 1]);
+      const tr = Math.max(tr1, tr2, tr3);
+      trueRanges.push(tr);
+    }
+
+    if (trueRanges.length < period) return 0;
+
+    const atr = trueRanges.slice(-period).reduce((a, b) => a + b, 0) / period;
+    return atr;
+  }
+
+  private calculateLiquidationPrice(position: Position): number {
+    if (position.collateral.length === 0 || position.debt.length === 0) {
+      return 0;
+    }
+
+    const totalCollateral = position.collateral.reduce((sum, c) => sum + c.valueUsd, 0);
+    const totalDebt = position.debt.reduce((sum, d) => sum + d.valueUsd, 0);
+
+    if (totalCollateral === 0 || totalDebt === 0) return 0;
+
+    const liquidationThreshold = position.liquidationThreshold || 0.85;
+    const collateralAmount = position.collateral[0]?.amount || 1;
+    const currentPrice = position.collateral[0]?.priceUsd || 1;
+
+    const liquidationPrice = (totalDebt * liquidationThreshold) / collateralAmount;
+    
+    return liquidationPrice;
+  }
+
+  private async getCurrentPrice(position: Position): Promise<number> {
+    if (position.collateral.length === 0) {
+      return 0;
+    }
+
+    const mintAddress = position.collateral[0].mint.toBase58();
+    const cached = this.priceCache.get(mintAddress);
+
+    if (cached && Date.now() - cached.timestamp < 30000) {
+      return cached.price;
+    }
+
+    try {
+      const response = await axios.get(`https://api.coingecko.com/api/v3/simple/price`, {
+        params: {
+          ids: this.getCoingeckoId(mintAddress),
+          vs_currencies: 'usd'
+        }
+      });
+
+      const price = Object.values(response.data)[0] as any;
+      const currentPrice = price?.usd || position.collateral[0]?.priceUsd || 1;
+
+      this.priceCache.set(mintAddress, {
+        price: currentPrice,
+        high: currentPrice * 1.02,
+        low: currentPrice * 0.98,
+        open: currentPrice,
+        change24h: 0,
+        volatility: 0.05,
+        volume: 1000000,
+        timestamp: Date.now()
+      });
+
+      return currentPrice;
+    } catch (error) {
+      return position.collateral[0]?.priceUsd || 1;
+    }
+  }
+
+  private getCoingeckoId(mintAddress: string): string {
+    const mapping: { [key: string]: string } = {
+      'So11111111111111111111111111111111111111112': 'solana',
+      'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v': 'usd-coin',
+      'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB': 'tether'
+    };
+    return mapping[mintAddress] || 'solana';
+  }
+
   async predictLiquidation(position: Position): Promise<LiquidationPrediction> {
     const riskScore = await this.calculateRisk(position);
     const mlFeatures = await this.calculateMLFeatures(position);
@@ -454,183 +697,4 @@ export class RiskEngine {
       thirtyMinuteProbability,
       hourlyProbability,
       predictionAccuracy,
-      riskHeatmap
-    };
-  }
-
-  private async calculateMovingAverages(position: Position): Promise<{ sma5: number; sma20: number; sma50: number; ema5: number; ema20: number; ema50: number; vwma20: number; bollinger: { upper: number; middle: number; lower: number } }> {
-    if (position.collateral.length === 0) {
-      return { 
-        sma5: 0, sma20: 0, sma50: 0, ema5: 0, ema20: 0, ema50: 0, vwma20: 0,
-        bollinger: { upper: 0, middle: 0, lower: 0 }
-      };
-    }
-
-    const mintAddress = position.collateral[0].mint.toBase58();
-    const priceData = this.historicalData.get(mintAddress) || [];
-
-    if (priceData.length === 0) {
-      const currentPrice = await this.getCurrentPrice(position);
-      return { 
-        sma5: currentPrice, sma20: currentPrice, sma50: currentPrice,
-        ema5: currentPrice, ema20: currentPrice, ema50: currentPrice,
-        vwma20: currentPrice,
-        bollinger: { upper: currentPrice, middle: currentPrice, lower: currentPrice }
-      };
-    }
-
-    const prices = priceData.map(d => d.price);
-    const volumes = priceData.map(d => d.volume);
-
-    const sma5 = prices.length >= 5 
-      ? prices.slice(-5).reduce((a, b) => a + b, 0) / 5
-      : prices.reduce((a, b) => a + b, 0) / prices.length;
-
-    const sma20 = prices.length >= 20
-      ? prices.slice(-20).reduce((a, b) => a + b, 0) / 20
-      : prices.reduce((a, b) => a + b, 0) / prices.length;
-
-    const sma50 = prices.length >= 50
-      ? prices.slice(-50).reduce((a, b) => a + b, 0) / 50
-      : prices.reduce((a, b) => a + b, 0) / prices.length;
-
-    let ema5 = prices[0];
-    let ema20 = prices[0];
-    let ema50 = prices[0];
-
-    for (let i = 1; i < prices.length; i++) {
-      ema5 = prices[i] * this.emaAlpha5 + ema5 * (1 - this.emaAlpha5);
-      ema20 = prices[i] * this.emaAlpha20 + ema20 * (1 - this.emaAlpha20);
-      ema50 = prices[i] * this.emaAlpha50 + ema50 * (1 - this.emaAlpha50);
-    }
-
-    const vwma20 = this.calculateVWMA(prices.slice(-20), volumes.slice(-20), 20);
-
-    const bollinger = this.calculateBollingerBands(prices.slice(-20), 2);
-
-    return { sma5, sma20, sma50, ema5, ema20, ema50, vwma20, bollinger };
-  }
-
-  private calculateVWMA(prices: number[], volumes: number[], period: number): number {
-    if (prices.length === 0 || volumes.length === 0) return 0;
-    
-    const length = Math.min(prices.length, volumes.length, period);
-    const recentPrices = prices.slice(-length);
-    const recentVolumes = volumes.slice(-length);
-    
-    let weightedSum = 0;
-    let volumeSum = 0;
-    
-    for (let i = 0; i < length; i++) {
-      weightedSum += recentPrices[i] * recentVolumes[i];
-      volumeSum += recentVolumes[i];
-    }
-    
-    return volumeSum > 0 ? weightedSum / volumeSum : recentPrices[length - 1];
-  }
-
-  private calculateBollingerBands(prices: number[], stdDev: number): { upper: number; middle: number; lower: number } {
-    if (prices.length === 0) return { upper: 0, middle: 0, lower: 0 };
-    
-    const middle = prices.reduce((a, b) => a + b, 0) / prices.length;
-    const variance = prices.reduce((sum, price) => sum + Math.pow(price - middle, 2), 0) / prices.length;
-    const standardDeviation = Math.sqrt(variance);
-    
-    return {
-      upper: middle + (standardDeviation * stdDev),
-      middle,
-      lower: middle - (standardDeviation * stdDev)
-    };
-  }
-
-  private async calculateAdvancedVolatility(position: Position): Promise<{ historicalVolatility: number; impliedVolatility: number; garchVolatility: number; rollingStd: number; parkinsonVolatility: number; garmanKlassVolatility: number; volatilityOfVolatility: number }> {
-    if (position.collateral.length === 0) {
-      return { 
-        historicalVolatility: 0, impliedVolatility: 0, garchVolatility: 0, rollingStd: 0,
-        parkinsonVolatility: 0, garmanKlassVolatility: 0, volatilityOfVolatility: 0
-      };
-    }
-
-    const mintAddress = position.collateral[0].mint.toBase58();
-    const priceData = this.historicalData.get(mintAddress) || [];
-
-    if (priceData.length < 10) {
-      const basicVol = await this.calculateVolatility(position);
-      return { 
-        historicalVolatility: basicVol, 
-        impliedVolatility: basicVol * 1.2, 
-        garchVolatility: basicVol, 
-        rollingStd: basicVol,
-        parkinsonVolatility: basicVol * 0.8,
-        garmanKlassVolatility: basicVol * 0.9,
-        volatilityOfVolatility: basicVol * 0.3
-      };
-    }
-
-    const prices = priceData.map(d => d.price);
-    const highs = priceData.map(d => d.high);
-    const lows = priceData.map(d => d.low);
-    const opens = priceData.map(d => d.open);
-
-    const returns = [];
-    for (let i = 1; i < prices.length; i++) {
-      returns.push(Math.log(prices[i] / prices[i - 1]));
-    }
-
-    const meanReturn = returns.reduce((a, b) => a + b, 0) / returns.length;
-    const variance = returns.reduce((sum, ret) => sum + Math.pow(ret - meanReturn, 2), 0) / returns.length;
-    const historicalVolatility = Math.sqrt(variance * 365 * 24);
-
-    const rollingWindow = Math.min(20, returns.length);
-    const recentReturns = returns.slice(-rollingWindow);
-    const recentMean = recentReturns.reduce((a, b) => a + b, 0) / recentReturns.length;
-    const rollingVariance = recentReturns.reduce((sum, ret) => sum + Math.pow(ret - recentMean, 2), 0) / recentReturns.length;
-    const rollingStd = Math.sqrt(rollingVariance * 365 * 24);
-
-    const garchVolatility = this.calculateGarchVolatility(mintAddress, returns);
-
-    const parkinsonVolatility = this.calculateParkinsonVolatility(highs, lows);
-    const garmanKlassVolatility = this.calculateGarmanKlassVolatility(opens, highs, lows, prices);
-
-    const volatilities = [];
-    for (let i = 10; i < returns.length; i++) {
-      const windowReturns = returns.slice(i - 10, i);
-      const windowMean = windowReturns.reduce((a, b) => a + b, 0) / windowReturns.length;
-      const windowVar = windowReturns.reduce((sum, ret) => sum + Math.pow(ret - windowMean, 2), 0) / windowReturns.length;
-      volatilities.push(Math.sqrt(windowVar));
-    }
-
-    const volMean = volatilities.reduce((a, b) => a + b, 0) / volatilities.length;
-    const volVariance = volatilities.reduce((sum, vol) => sum + Math.pow(vol - volMean, 2), 0) / volatilities.length;
-    const volatilityOfVolatility = Math.sqrt(volVariance * 365 * 24);
-
-    const impliedVolatility = historicalVolatility * (1.1 + Math.random() * 0.3);
-
-    return { 
-      historicalVolatility, 
-      impliedVolatility, 
-      garchVolatility, 
-      rollingStd, 
-      parkinsonVolatility, 
-      garmanKlassVolatility, 
-      volatilityOfVolatility 
-    };
-  }
-
-  private calculateParkinsonVolatility(highs: number[], lows: number[]): number {
-    if (highs.length === 0 || lows.length === 0) return 0;
-    
-    const ratios = [];
-    for (let i = 0; i < Math.min(highs.length, lows.length); i++) {
-      if (lows[i] > 0 && highs[i] > 0) {
-        ratios.push(Math.log(highs[i] / lows[i]));
-      }
-    }
-    
-    const meanLogRatio = ratios.reduce((sum, ratio) => sum + Math.pow(ratio, 2), 0) / ratios.length;
-    return Math.sqrt(meanLogRatio / (4 * Math.log(2)) * 365 * 24);
-  }
-
-  private calculateGarmanKlassVolatility(opens: number[], highs: number[], lows: number[], closes: number[]): number {
-    if (opens.length === 0) return 0;
-}}
+}}}
