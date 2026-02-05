@@ -36,6 +36,9 @@ export class PositionMonitor {
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 5;
   private reconnectDelay = 1000;
+  private subscriptionIds: Map<string, number> = new Map();
+  private subscriptionCounter = 0;
+  private heartbeatInterval: NodeJS.Timeout | null = null;
 
   constructor(connection: Connection, heliusApiKey: string) {
     this.connection = connection;
@@ -66,11 +69,15 @@ export class PositionMonitor {
   async startWebSocketMonitoring(): Promise<void> {
     const wsUrl = `wss://atlas-mainnet.helius-rpc.com/?api-key=${this.heliusApiKey}`;
     
-    this.heliusWs = new WebSocket(wsUrl);
+    this.heliusWs = new WebSocket(wsUrl, {
+      perMessageDeflate: false,
+      handshakeTimeout: 30000,
+    });
 
     this.heliusWs.on('open', () => {
       console.log('[WEBSOCKET] Connected to Helius');
       this.reconnectAttempts = 0;
+      this.startHeartbeat();
       
       for (const address of this.watchedAddresses) {
         this.subscribeToAddress(address);
@@ -86,15 +93,39 @@ export class PositionMonitor {
       }
     });
 
-    this.heliusWs.on('close', () => {
-      console.log('[WEBSOCKET] Connection closed');
+    this.heliusWs.on('close', (code: number, reason: Buffer) => {
+      console.log(`[WEBSOCKET] Connection closed - Code: ${code}, Reason: ${reason.toString()}`);
+      this.stopHeartbeat();
       this.attemptReconnect();
     });
 
-    this.heliusWs.on('error', (error) => {
+    this.heliusWs.on('error', (error: Error) => {
       console.error('[WEBSOCKET] Error:', error);
+      this.stopHeartbeat();
       this.attemptReconnect();
     });
+
+    this.heliusWs.on('pong', () => {
+      console.log('[WEBSOCKET] Pong received - connection alive');
+    });
+  }
+
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    
+    this.heartbeatInterval = setInterval(() => {
+      if (this.heliusWs && this.heliusWs.readyState === WebSocket.OPEN) {
+        this.heliusWs.ping();
+        console.log('[WEBSOCKET] Ping sent');
+      }
+    }, 30000);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
   }
 
   private attemptReconnect(): void {
@@ -104,11 +135,12 @@ export class PositionMonitor {
     }
 
     this.reconnectAttempts++;
-    console.log(`[WEBSOCKET] Attempting to reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+    const delay = Math.min(this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1), 30000);
+    console.log(`[WEBSOCKET] Attempting to reconnect in ${delay}ms (${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
 
     setTimeout(() => {
       this.startWebSocketMonitoring();
-    }, this.reconnectDelay * this.reconnectAttempts);
+    }, delay);
   }
 
   private subscribeToAddress(address: string): void {
@@ -116,21 +148,28 @@ export class PositionMonitor {
       return;
     }
 
+    const subscriptionId = ++this.subscriptionCounter;
+    this.subscriptionIds.set(address, subscriptionId);
+
     const subscription = {
       jsonrpc: '2.0',
-      id: `account-${address}`,
+      id: subscriptionId,
       method: 'accountSubscribe',
       params: [
         address,
         {
           encoding: 'base64',
-          commitment: 'confirmed'
+          commitment: 'confirmed',
+          dataSlice: {
+            offset: 0,
+            length: 0
+          }
         }
       ]
     };
 
     this.heliusWs.send(JSON.stringify(subscription));
-    console.log(`[WEBSOCKET] Subscribed to account: ${address}`);
+    console.log(`[WEBSOCKET] Subscribed to account: ${address} (ID: ${subscriptionId})`);
   }
 
   private unsubscribeFromAddress(address: string): void {
@@ -138,32 +177,63 @@ export class PositionMonitor {
       return;
     }
 
+    const subscriptionId = this.subscriptionIds.get(address);
+    if (!subscriptionId) {
+      return;
+    }
+
     const unsubscribe = {
       jsonrpc: '2.0',
-      id: `unsubscribe-${address}`,
+      id: ++this.subscriptionCounter,
       method: 'accountUnsubscribe',
-      params: [`account-${address}`]
+      params: [subscriptionId]
     };
 
     this.heliusWs.send(JSON.stringify(unsubscribe));
-    console.log(`[WEBSOCKET] Unsubscribed from account: ${address}`);
+    this.subscriptionIds.delete(address);
+    console.log(`[WEBSOCKET] Unsubscribed from account: ${address} (ID: ${subscriptionId})`);
   }
 
   private async handleWebSocketMessage(message: any): Promise<void> {
     if (message.method === 'accountNotification') {
-      const { pubkey, account } = message.params.result.value;
-      console.log(`[WEBSOCKET] Account update for: ${pubkey}`);
-      
-      await this.processAccountUpdate(pubkey);
+      const notification = message.params;
+      if (notification && notification.result && notification.result.value) {
+        const pubkey = notification.result.context?.slot ? 
+          this.findAddressBySubscriptionId(notification.subscription) : null;
+        
+        if (pubkey) {
+          console.log(`[WEBSOCKET] Account update for: ${pubkey}`);
+          await this.processAccountUpdate(pubkey);
+        }
+      }
+    } else if (message.result && typeof message.result === 'number') {
+      console.log(`[WEBSOCKET] Subscription confirmed with ID: ${message.result}`);
+    } else if (message.error) {
+      console.error('[WEBSOCKET] RPC Error:', message.error);
     }
+  }
+
+  private findAddressBySubscriptionId(subscriptionId: number): string | null {
+    for (const [address, id] of this.subscriptionIds.entries()) {
+      if (id === subscriptionId) {
+        return address;
+      }
+    }
+    return null;
   }
 
   private async processAccountUpdate(address: string): Promise<void> {
     try {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
       const pubkey = new PublicKey(address);
       const currentPositions = await this.fetchPositionsForAddress(pubkey);
       
-      for (const position of currentPositions) {
+      const addressPositions = currentPositions.filter(p => p.owner.equals(pubkey));
+      const previousAddressPositions = Array.from(this.previousPositions.values())
+        .filter(p => p.owner.equals(pubkey));
+      
+      for (const position of addressPositions) {
         const previousPosition = this.previousPositions.get(position.id);
         
         if (!previousPosition) {
@@ -188,9 +258,8 @@ export class PositionMonitor {
         }
       }
       
-      for (const [positionId, previousPosition] of this.previousPositions.entries()) {
-        if (previousPosition.owner.equals(pubkey) && 
-            !currentPositions.find(p => p.id === positionId)) {
+      for (const previousPosition of previousAddressPositions) {
+        if (!addressPositions.find(p => p.id === previousPosition.id)) {
           const change: PositionChange = {
             position: previousPosition,
             changeType: 'deleted',
@@ -198,7 +267,7 @@ export class PositionMonitor {
           };
           
           this.notifyPositionChange(change);
-          this.previousPositions.delete(positionId);
+          this.previousPositions.delete(previousPosition.id);
         }
       }
     } catch (error) {
@@ -207,20 +276,24 @@ export class PositionMonitor {
   }
 
   private hasPositionChanged(previous: Position, current: Position): boolean {
-    if (previous.healthFactor !== current.healthFactor) return true;
+    if (Math.abs(previous.healthFactor - current.healthFactor) > 0.001) return true;
     if (previous.collateral.length !== current.collateral.length) return true;
     if (previous.debt.length !== current.debt.length) return true;
     
     for (let i = 0; i < previous.collateral.length; i++) {
-      if (previous.collateral[i].amount !== current.collateral[i].amount ||
-          previous.collateral[i].valueUsd !== current.collateral[i].valueUsd) {
+      const prevColl = previous.collateral[i];
+      const currColl = current.collateral[i];
+      if (Math.abs(prevColl.amount - currColl.amount) > 0.001 ||
+          Math.abs(prevColl.valueUsd - currColl.valueUsd) > 0.01) {
         return true;
       }
     }
     
     for (let i = 0; i < previous.debt.length; i++) {
-      if (previous.debt[i].amount !== current.debt[i].amount ||
-          previous.debt[i].valueUsd !== current.debt[i].valueUsd) {
+      const prevDebt = previous.debt[i];
+      const currDebt = current.debt[i];
+      if (Math.abs(prevDebt.amount - currDebt.amount) > 0.001 ||
+          Math.abs(prevDebt.valueUsd - currDebt.valueUsd) > 0.01) {
         return true;
       }
     }
@@ -229,7 +302,11 @@ export class PositionMonitor {
   }
 
   private notifyPositionChange(change: PositionChange): void {
-    console.log(`[MONITOR] Position ${change.changeType}: ${change.position.id}`);
+    console.log(`[MONITOR] Position ${change.changeType}: ${change.position.id} (Protocol: ${change.position.protocol})`);
+    
+    if (change.changeType === 'updated' && change.previousPosition) {
+      console.log(`[MONITOR] Health factor changed: ${change.previousPosition.healthFactor} -> ${change.position.healthFactor}`);
+    }
     
     for (const callback of this.changeCallbacks) {
       try {
@@ -244,11 +321,29 @@ export class PositionMonitor {
     const positions: Position[] = [];
 
     try {
-      const marginfiPositions = await this.fetchMarginfiPositions(owner);
-      const kaminoPositions = await this.fetchKaminoPositions(owner);
-      const driftPositions = await this.fetchDriftPositions(owner);
+      const [marginfiPositions, kaminoPositions, driftPositions] = await Promise.allSettled([
+        this.fetchMarginfiPositions(owner),
+        this.fetchKaminoPositions(owner),
+        this.fetchDriftPositions(owner)
+      ]);
 
-      positions.push(...marginfiPositions, ...kaminoPositions, ...driftPositions);
+      if (marginfiPositions.status === 'fulfilled') {
+        positions.push(...marginfiPositions.value);
+      } else {
+        console.error('[MARGINFI] Error fetching positions:', marginfiPositions.reason);
+      }
+
+      if (kaminoPositions.status === 'fulfilled') {
+        positions.push(...kaminoPositions.value);
+      } else {
+        console.error('[KAMINO] Error fetching positions:', kaminoPositions.reason);
+      }
+
+      if (driftPositions.status === 'fulfilled') {
+        positions.push(...driftPositions.value);
+      } else {
+        console.error('[DRIFT] Error fetching positions:', driftPositions.reason);
+      }
     } catch (error) {
       console.error(`[MONITOR] Error fetching positions for ${owner.toBase58()}:`, error);
     }
@@ -258,21 +353,29 @@ export class PositionMonitor {
 
   async fetchAllPositions(): Promise<Position[]> {
     const positions: Position[] = [];
+    const fetchPromises: Promise<void>[] = [];
 
     for (const address of this.watchedAddresses) {
-      try {
-        const pubkey = new PublicKey(address);
-        const addressPositions = await this.fetchPositionsForAddress(pubkey);
-        positions.push(...addressPositions);
-        
-        for (const position of addressPositions) {
-          this.previousPositions.set(position.id, position);
-        }
-      } catch (error) {
-        console.error(`[MONITOR] Error fetching positions for ${address}:`, error);
-      }
+      fetchPromises.push(
+        (async () => {
+          try {
+            const pubkey = new PublicKey(address);
+            const addressPositions = await this.fetchPositionsForAddress(pubkey);
+            positions.push(...addressPositions);
+            
+            for (const position of addressPositions) {
+              this.previousPositions.set(position.id, position);
+            }
+          } catch (error) {
+            console.error(`[MONITOR] Error fetching positions for ${address}:`, error);
+          }
+        })()
+      );
     }
 
+    await Promise.allSettled(fetchPromises);
+    console.log(`[MONITOR] Fetched ${positions.length} total positions across all addresses`);
+    
     return positions;
   }
 
@@ -287,12 +390,13 @@ export class PositionMonitor {
       const accounts = await this.connection.getProgramAccounts(MARGINFI_PROGRAM_ID, {
         filters: [
           { memcmp: { offset: 8, bytes: owner.toBase58() } }
-        ]
+        ],
+        dataSlice: { offset: 0, length: 0 }
       });
 
       for (const account of accounts) {
         positions.push({
-          id: account.pubkey.toBase58(),
+          id: `marginfi-${account.pubkey.toBase58()}`,
           protocol: 'marginfi',
           owner,
           collateral: [],
@@ -301,6 +405,8 @@ export class PositionMonitor {
           timestamp: Date.now(),
         });
       }
+
+      console.log(`[MARGINFI] Found ${positions.length} positions`);
     } catch (error) {
       console.error('[MARGINFI] Error:', error);
     }
@@ -319,12 +425,13 @@ export class PositionMonitor {
       const accounts = await this.connection.getProgramAccounts(KAMINO_PROGRAM_ID, {
         filters: [
           { memcmp: { offset: 8, bytes: owner.toBase58() } }
-        ]
+        ],
+        dataSlice: { offset: 0, length: 0 }
       });
 
       for (const account of accounts) {
         positions.push({
-          id: account.pubkey.toBase58(),
+          id: `kamino-${account.pubkey.toBase58()}`,
           protocol: 'kamino',
           owner,
           collateral: [],
@@ -333,6 +440,8 @@ export class PositionMonitor {
           timestamp: Date.now(),
         });
       }
+
+      console.log(`[KAMINO] Found ${positions.length} positions`);
     } catch (error) {
       console.error('[KAMINO] Error:', error);
     }
@@ -351,12 +460,13 @@ export class PositionMonitor {
       const accounts = await this.connection.getProgramAccounts(DRIFT_PROGRAM_ID, {
         filters: [
           { memcmp: { offset: 8, bytes: owner.toBase58() } }
-        ]
+        ],
+        dataSlice: { offset: 0, length: 0 }
       });
 
       for (const account of accounts) {
         positions.push({
-          id: account.pubkey.toBase58(),
+          id: `drift-${account.pubkey.toBase58()}`,
           protocol: 'drift',
           owner,
           collateral: [],
@@ -365,6 +475,8 @@ export class PositionMonitor {
           timestamp: Date.now(),
         });
       }
+
+      console.log(`[DRIFT] Found ${positions.length} positions`);
     } catch (error) {
       console.error('[DRIFT] Error:', error);
     }
@@ -372,10 +484,45 @@ export class PositionMonitor {
     return positions;
   }
 
+  getConnectionStatus(): string {
+    if (!this.heliusWs) return 'disconnected';
+    
+    switch (this.heliusWs.readyState) {
+      case WebSocket.CONNECTING: return 'connecting';
+      case WebSocket.OPEN: return 'connected';
+      case WebSocket.CLOSING: return 'closing';
+      case WebSocket.CLOSED: return 'closed';
+      default: return 'unknown';
+    }
+  }
+
+  getWatchedAddresses(): string[] {
+    return Array.from(this.watchedAddresses);
+  }
+
+  getSubscriptionCount(): number {
+    return this.subscriptionIds.size;
+  }
+
   async stopWebSocketMonitoring(): Promise<void> {
+    this.stopHeartbeat();
+    
     if (this.heliusWs) {
-      this.heliusWs.close();
+      for (const address of this.watchedAddresses) {
+        this.unsubscribeFromAddress(address);
+      }
+      
+      await new Promise<void>((resolve) => {
+        if (this.heliusWs) {
+          this.heliusWs.close(1000, 'Manual shutdown');
+          this.heliusWs.on('close', () => resolve());
+        } else {
+          resolve();
+        }
+      });
+      
       this.heliusWs = null;
+      this.subscriptionIds.clear();
       console.log('[WEBSOCKET] Stopped monitoring');
     }
   }
