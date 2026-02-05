@@ -33,6 +33,39 @@ interface SentinelConfig {
   port?: number;
 }
 
+interface HealthStatus {
+  status: 'healthy' | 'degraded' | 'unhealthy';
+  timestamp: string;
+  uptime: number;
+  version: string;
+  environment: string;
+  rpcUrl: string;
+  totalPositions: number;
+  lastUpdate: string;
+  services: {
+    positionMonitor: boolean;
+    riskEngine: boolean;
+    alertSystem: boolean;
+    heartbeat: boolean;
+  };
+  memoryUsage: NodeJS.MemoryUsage;
+  connectionStatus: 'connected' | 'disconnected' | 'unknown';
+}
+
+interface PositionStatus {
+  positions: any[];
+  totalCount: number;
+  timestamp: string;
+  riskSummary: {
+    critical: number;
+    warning: number;
+    healthy: number;
+  };
+  lastMonitoringCycle: string;
+  averageHealthFactor: number;
+  topRiskyPositions: any[];
+}
+
 class Sentinel {
   private connection: Connection;
   private positionMonitor: PositionMonitor;
@@ -45,6 +78,13 @@ class Sentinel {
   private isShuttingDown = false;
   private positions: any[] = [];
   private lastPositionsUpdate = 0;
+  private lastMonitoringCycle = 0;
+  private serviceStatus = {
+    positionMonitor: true,
+    riskEngine: true,
+    alertSystem: true,
+    heartbeat: true
+  };
 
   constructor(config: SentinelConfig) {
     this.config = config;
@@ -60,64 +100,210 @@ class Sentinel {
 
   private setupExpressApp(): void {
     this.app.use(express.json());
-
-    // Health check endpoint
-    this.app.get('/health', (req: Request, res: Response) => {
-      const healthData = {
-        status: 'healthy',
-        timestamp: new Date().toISOString(),
-        uptime: process.uptime(),
-        version: process.env.npm_package_version || '1.0.0',
-        environment: process.env.NODE_ENV || 'development',
-        rpcUrl: this.config.rpcUrl,
-        totalPositions: this.positions.length,
-        lastUpdate: new Date(this.lastPositionsUpdate).toISOString()
-      };
-      res.json(healthData);
+    this.app.use((req: Request, res: Response, next) => {
+      console.log(`[API] ${req.method} ${req.path} - ${new Date().toISOString()}`);
+      next();
     });
 
-    // Position status endpoint
+    this.app.get('/health', async (req: Request, res: Response) => {
+      try {
+        const connectionStatus = await this.checkRPCConnection();
+        const healthData: HealthStatus = {
+          status: this.determineOverallHealth(connectionStatus),
+          timestamp: new Date().toISOString(),
+          uptime: process.uptime(),
+          version: process.env.npm_package_version || '1.0.0',
+          environment: process.env.NODE_ENV || 'development',
+          rpcUrl: this.config.rpcUrl,
+          totalPositions: this.positions.length,
+          lastUpdate: this.lastPositionsUpdate ? new Date(this.lastPositionsUpdate).toISOString() : 'never',
+          services: { ...this.serviceStatus },
+          memoryUsage: process.memoryUsage(),
+          connectionStatus
+        };
+
+        const statusCode = healthData.status === 'healthy' ? 200 : 
+                          healthData.status === 'degraded' ? 200 : 503;
+        
+        res.status(statusCode).json(healthData);
+      } catch (error) {
+        console.error('[API] Health check error:', error);
+        res.status(503).json({
+          status: 'unhealthy',
+          error: 'Health check failed',
+          timestamp: new Date().toISOString()
+        });
+      }
+    });
+
     this.app.get('/positions', async (req: Request, res: Response) => {
       try {
         const positionsWithRisk = await Promise.all(
           this.positions.map(async (position) => {
-            const riskScore = await this.riskEngine.calculateRisk(position);
-            const prediction = await this.riskEngine.predictLiquidation(position);
-            return {
-              ...position,
-              riskScore,
-              prediction,
-              lastUpdated: new Date(this.lastPositionsUpdate).toISOString()
-            };
+            try {
+              const riskScore = await this.riskEngine.calculateRisk(position);
+              const prediction = await this.riskEngine.predictLiquidation(position);
+              return {
+                ...position,
+                riskScore,
+                prediction,
+                lastUpdated: new Date(this.lastPositionsUpdate).toISOString()
+              };
+            } catch (error) {
+              console.error('[API] Error processing position:', error);
+              return {
+                ...position,
+                error: 'Risk calculation failed',
+                lastUpdated: new Date(this.lastPositionsUpdate).toISOString()
+              };
+            }
           })
         );
 
-        res.json({
+        const healthyPositions = positionsWithRisk.filter(p => p.riskScore && p.riskScore.healthFactor >= this.config.liquidationWarningThreshold);
+        const warningPositions = positionsWithRisk.filter(p => p.riskScore && p.riskScore.healthFactor < this.config.liquidationWarningThreshold && p.riskScore.healthFactor >= this.config.criticalHealthThreshold);
+        const criticalPositions = positionsWithRisk.filter(p => p.riskScore && p.riskScore.healthFactor < this.config.criticalHealthThreshold);
+
+        const validHealthFactors = positionsWithRisk
+          .filter(p => p.riskScore && typeof p.riskScore.healthFactor === 'number')
+          .map(p => p.riskScore.healthFactor);
+        
+        const averageHealthFactor = validHealthFactors.length > 0 
+          ? validHealthFactors.reduce((sum, hf) => sum + hf, 0) / validHealthFactors.length 
+          : 0;
+
+        const topRiskyPositions = positionsWithRisk
+          .filter(p => p.riskScore)
+          .sort((a, b) => a.riskScore.healthFactor - b.riskScore.healthFactor)
+          .slice(0, 5);
+
+        const positionStatus: PositionStatus = {
           positions: positionsWithRisk,
           totalCount: positionsWithRisk.length,
           timestamp: new Date().toISOString(),
           riskSummary: {
-            critical: positionsWithRisk.filter(p => p.riskScore.healthFactor < this.config.criticalHealthThreshold).length,
-            warning: positionsWithRisk.filter(p => p.riskScore.healthFactor < this.config.liquidationWarningThreshold && p.riskScore.healthFactor >= this.config.criticalHealthThreshold).length,
-            healthy: positionsWithRisk.filter(p => p.riskScore.healthFactor >= this.config.liquidationWarningThreshold).length
-          }
-        });
+            critical: criticalPositions.length,
+            warning: warningPositions.length,
+            healthy: healthyPositions.length
+          },
+          lastMonitoringCycle: this.lastMonitoringCycle ? new Date(this.lastMonitoringCycle).toISOString() : 'never',
+          averageHealthFactor,
+          topRiskyPositions
+        };
+
+        res.json(positionStatus);
       } catch (error) {
         console.error('[API] Error fetching positions:', error);
         res.status(500).json({
           error: 'Failed to fetch positions',
+          message: error instanceof Error ? error.message : 'Unknown error',
+          timestamp: new Date().toISOString()
+        });
+      }
+    });
+
+    this.app.get('/positions/:id', async (req: Request, res: Response) => {
+      try {
+        const positionId = req.params.id;
+        const position = this.positions.find(p => p.id === positionId || p.publicKey === positionId);
+        
+        if (!position) {
+          return res.status(404).json({
+            error: 'Position not found',
+            timestamp: new Date().toISOString()
+          });
+        }
+
+        const riskScore = await this.riskEngine.calculateRisk(position);
+        const prediction = await this.riskEngine.predictLiquidation(position);
+
+        res.json({
+          ...position,
+          riskScore,
+          prediction,
+          lastUpdated: new Date(this.lastPositionsUpdate).toISOString()
+        });
+      } catch (error) {
+        console.error('[API] Error fetching position:', error);
+        res.status(500).json({
+          error: 'Failed to fetch position',
           message: error instanceof Error ? error.message : 'Unknown error'
         });
       }
     });
 
-    // Graceful shutdown status
-    this.app.get('/shutdown', (req: Request, res: Response) => {
+    this.app.get('/status', (req: Request, res: Response) => {
       res.json({
+        isRunning: !this.isShuttingDown,
         shuttingDown: this.isShuttingDown,
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+        pid: process.pid,
+        nodeVersion: process.version,
+        platform: process.platform
+      });
+    });
+
+    this.app.post('/shutdown', (req: Request, res: Response) => {
+      if (this.isShuttingDown) {
+        return res.json({
+          message: 'Shutdown already in progress',
+          timestamp: new Date().toISOString()
+        });
+      }
+
+      res.json({
+        message: 'Graceful shutdown initiated',
+        timestamp: new Date().toISOString()
+      });
+
+      setTimeout(() => {
+        process.kill(process.pid, 'SIGTERM');
+      }, 1000);
+    });
+
+    this.app.use((req: Request, res: Response) => {
+      res.status(404).json({
+        error: 'Not Found',
+        message: `Route ${req.method} ${req.path} not found`,
         timestamp: new Date().toISOString()
       });
     });
+
+    this.app.use((error: Error, req: Request, res: Response, next: any) => {
+      console.error('[API] Unhandled error:', error);
+      res.status(500).json({
+        error: 'Internal Server Error',
+        message: error.message,
+        timestamp: new Date().toISOString()
+      });
+    });
+  }
+
+  private async checkRPCConnection(): Promise<'connected' | 'disconnected' | 'unknown'> {
+    try {
+      await this.connection.getSlot();
+      return 'connected';
+    } catch (error) {
+      console.error('[HEALTH] RPC connection check failed:', error);
+      return 'disconnected';
+    }
+  }
+
+  private determineOverallHealth(connectionStatus: 'connected' | 'disconnected' | 'unknown'): 'healthy' | 'degraded' | 'unhealthy' {
+    if (connectionStatus === 'disconnected') {
+      return 'unhealthy';
+    }
+
+    const servicesDown = Object.values(this.serviceStatus).filter(status => !status).length;
+    
+    if (servicesDown === 0) {
+      return 'healthy';
+    } else if (servicesDown <= 2) {
+      return 'degraded';
+    } else {
+      return 'unhealthy';
+    }
   }
 
   private setupGracefulShutdown(): void {
@@ -125,24 +311,43 @@ class Sentinel {
       console.log(`[SENTINEL] Received ${signal}, starting graceful shutdown...`);
       this.isShuttingDown = true;
 
-      if (this.server) {
-        this.server.close(() => {
-          console.log('[SENTINEL] HTTP server closed');
-        });
-      }
+      const shutdownTimeout = setTimeout(() => {
+        console.log('[SENTINEL] Shutdown timeout reached, forcing exit');
+        process.exit(1);
+      }, 30000);
 
       try {
+        if (this.server) {
+          await new Promise<void>((resolve) => {
+            this.server!.close(() => {
+              console.log('[SENTINEL] HTTP server closed');
+              resolve();
+            });
+          });
+        }
+
         await this.heartbeat.stop();
         console.log('[SENTINEL] Services stopped successfully');
+        
+        clearTimeout(shutdownTimeout);
         process.exit(0);
       } catch (error) {
         console.error('[SENTINEL] Error during shutdown:', error);
+        clearTimeout(shutdownTimeout);
         process.exit(1);
       }
     };
 
     process.on('SIGTERM', () => shutdown('SIGTERM'));
     process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('uncaughtException', (error) => {
+      console.error('[SENTINEL] Uncaught exception:', error);
+      shutdown('uncaughtException');
+    });
+    process.on('unhandledRejection', (reason, promise) => {
+      console.error('[SENTINEL] Unhandled rejection at:', promise, 'reason:', reason);
+      shutdown('unhandledRejection');
+    });
   }
 
   async start(): Promise<void> {
@@ -152,57 +357,75 @@ class Sentinel {
     console.log(`[SENTINEL] Critical threshold: ${this.config.criticalHealthThreshold}`);
     console.log(`[SENTINEL] Prediction horizon: ${this.config.predictionHorizonMinutes} minutes`);
 
-    // Start Express server
-    const port = this.config.port || 3000;
-    this.server = this.app.listen(port, () => {
-      console.log(`[SENTINEL] API server started on port ${port}`);
-      console.log(`[SENTINEL] Health check: http://localhost:${port}/health`);
-      console.log(`[SENTINEL] Positions API: http://localhost:${port}/positions`);
-    });
+    try {
+      const port = this.config.port || 3000;
+      this.server = this.app.listen(port, () => {
+        console.log(`[SENTINEL] API server started on port ${port}`);
+        console.log(`[SENTINEL] Health check: http://localhost:${port}/health`);
+        console.log(`[SENTINEL] Positions API: http://localhost:${port}/positions`);
+        console.log(`[SENTINEL] Status: http://localhost:${port}/status`);
+        console.log(`[SENTINEL] Shutdown: POST http://localhost:${port}/shutdown`);
+      });
 
-    // Start heartbeat for hackathon
-    await this.heartbeat.start();
+      this.server.on('error', (error) => {
+        console.error('[SENTINEL] Server error:', error);
+        this.serviceStatus.alertSystem = false;
+      });
 
-    // Start position monitoring loop
-    this.monitorLoop();
+      await this.heartbeat.start();
+      this.monitorLoop();
+    } catch (error) {
+      console.error('[SENTINEL] Failed to start server:', error);
+      throw error;
+    }
   }
 
   private async monitorLoop(): Promise<void> {
     console.log('[SENTINEL] Entering monitoring loop...');
 
     while (!this.isShuttingDown) {
+      const cycleStart = Date.now();
+      
       try {
-        // 1. Fetch all positions from supported protocols
+        this.serviceStatus.positionMonitor = true;
         const positions = await this.positionMonitor.fetchAllPositions();
         this.positions = positions;
         this.lastPositionsUpdate = Date.now();
         console.log(`[MONITOR] Found ${positions.length} active positions`);
 
-        // 2. Calculate risk scores for each position
+        this.serviceStatus.riskEngine = true;
         for (const position of positions) {
           if (this.isShuttingDown) break;
 
-          const riskScore = await this.riskEngine.calculateRisk(position);
+          try {
+            const riskScore = await this.riskEngine.calculateRisk(position);
 
-          // 3. Check if alert needed
-          if (riskScore.healthFactor < this.config.criticalHealthThreshold) {
-            await this.alertSystem.sendCriticalAlert(position, riskScore);
-          } else if (riskScore.healthFactor < this.config.liquidationWarningThreshold) {
-            await this.alertSystem.sendWarningAlert(position, riskScore);
-          }
+            this.serviceStatus.alertSystem = true;
+            if (riskScore.healthFactor < this.config.criticalHealthThreshold) {
+              await this.alertSystem.sendCriticalAlert(position, riskScore);
+            } else if (riskScore.healthFactor < this.config.liquidationWarningThreshold) {
+              await this.alertSystem.sendWarningAlert(position, riskScore);
+            }
 
-          // 4. ML-based prediction
-          const prediction = await this.riskEngine.predictLiquidation(position);
-          if (prediction.minutesToLiquidation < this.config.predictionHorizonMinutes) {
-            await this.alertSystem.sendPredictionAlert(position, prediction);
+            const prediction = await this.riskEngine.predictLiquidation(position);
+            if (prediction.minutesToLiquidation < this.config.predictionHorizonMinutes) {
+              await this.alertSystem.sendPredictionAlert(position, prediction);
+            }
+          } catch (error) {
+            console.error('[MONITOR] Error processing position:', error);
+            this.serviceStatus.riskEngine = false;
           }
         }
 
-        // Wait before next iteration (10 seconds)
-        await this.sleep(10000);
+        this.lastMonitoringCycle = Date.now();
+        const cycleDuration = this.lastMonitoringCycle - cycleStart;
+        console.log(`[MONITOR] Cycle completed in ${cycleDuration}ms`);
+
+        await this.sleep(Math.max(1000, 10000 - cycleDuration));
 
       } catch (error) {
         console.error('[SENTINEL] Error in monitoring loop:', error);
+        this.serviceStatus.positionMonitor = false;
         await this.sleep(5000);
       }
     }
@@ -215,7 +438,6 @@ class Sentinel {
   }
 }
 
-// Main entry point
 async function main() {
   const config: SentinelConfig = {
     rpcUrl: process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
@@ -233,4 +455,4 @@ async function main() {
 
 main().catch(console.error);
 
-export { Sentinel, SentinelConfig };
+export { Sentinel, SentinelConfig, HealthStatus, PositionStatus };
