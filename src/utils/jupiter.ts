@@ -72,6 +72,40 @@ export interface OptimalRebalanceStrategy {
   riskLevel: 'low' | 'medium' | 'high';
 }
 
+export interface RouteAnalysis {
+  route: SwapQuote;
+  priceImpact: PriceImpact;
+  liquidityScore: number;
+  executionRisk: 'low' | 'medium' | 'high';
+  alternativeRoutes?: SwapQuote[];
+}
+
+export interface MarketDepth {
+  token: string;
+  bidDepth: number;
+  askDepth: number;
+  spread: number;
+  liquidityTier: 'high' | 'medium' | 'low';
+}
+
+export interface SwapRouteOptimization {
+  originalRoute: SwapQuote;
+  optimizedRoute: SwapQuote;
+  improvement: {
+    priceImpactReduction: number;
+    outputIncrease: number;
+    feeReduction: number;
+  };
+  splitStrategy?: {
+    splits: Array<{
+      percentage: number;
+      route: SwapQuote;
+      priceImpact: number;
+    }>;
+    combinedPriceImpact: number;
+  };
+}
+
 // Common Solana token mints
 export const TOKENS = {
   SOL: 'So11111111111111111111111111111111111111112',
@@ -85,7 +119,9 @@ export const TOKENS = {
 
 export class JupiterPriceFeed {
   private cache: Map<string, { price: TokenPrice; timestamp: number }> = new Map();
+  private routeCache: Map<string, { routes: SwapQuote[]; timestamp: number }> = new Map();
   private cacheTtl: number = 10000; // 10 seconds
+  private routeCacheTtl: number = 5000; // 5 seconds for routes
 
   async getPrice(mint: string): Promise<TokenPrice | null> {
     // Check cache
@@ -174,6 +210,42 @@ export class JupiterPriceFeed {
     }
   }
 
+  async getMultipleSwapQuotes(
+    inputMint: string,
+    outputMint: string,
+    amount: string,
+    slippageOptions: number[] = [25, 50, 100, 300]
+  ): Promise<SwapQuote[]> {
+    const cacheKey = `${inputMint}-${outputMint}-${amount}`;
+    const cached = this.routeCache.get(cacheKey);
+    
+    if (cached && Date.now() - cached.timestamp < this.routeCacheTtl) {
+      return cached.routes;
+    }
+
+    const quotes: SwapQuote[] = [];
+    
+    try {
+      const requests = slippageOptions.map(slippage => 
+        this.getSwapQuote(inputMint, outputMint, amount, slippage)
+      );
+      
+      const results = await Promise.allSettled(requests);
+      
+      for (const result of results) {
+        if (result.status === 'fulfilled' && result.value) {
+          quotes.push(result.value);
+        }
+      }
+
+      this.routeCache.set(cacheKey, { routes: quotes, timestamp: Date.now() });
+    } catch (error) {
+      console.error('[JUPITER] Error fetching multiple quotes:', error);
+    }
+
+    return quotes;
+  }
+
   calculatePriceImpact(quote: SwapQuote): PriceImpact {
     const impactPct = parseFloat(quote.priceImpactPct);
     
@@ -190,6 +262,188 @@ export class JupiterPriceFeed {
     };
   }
 
+  calculateLiquidityScore(quote: SwapQuote): number {
+    let score = 100;
+    const priceImpact = parseFloat(quote.priceImpactPct);
+    const routeCount = quote.routePlan.length;
+    
+    // Penalize high price impact
+    score -= priceImpact * 10;
+    
+    // Prefer fewer route splits for simplicity
+    score -= (routeCount - 1) * 5;
+    
+    // Bonus for well-known AMMs
+    const wellKnownAmms = ['Raydium', 'Orca', 'Jupiter', 'Meteora'];
+    const hasWellKnownAmm = quote.routePlan.some(plan => 
+      wellKnownAmms.some(amm => plan.swapInfo.label.includes(amm))
+    );
+    
+    if (hasWellKnownAmm) score += 10;
+    
+    return Math.max(0, Math.min(100, score));
+  }
+
+  async analyzeRoute(
+    inputMint: string,
+    outputMint: string,
+    amount: string
+  ): Promise<RouteAnalysis> {
+    const quotes = await this.getMultipleSwapQuotes(inputMint, outputMint, amount);
+    
+    if (quotes.length === 0) {
+      throw new Error('No routes found');
+    }
+
+    // Select best quote based on output amount and price impact
+    const bestQuote = quotes.reduce((best, current) => {
+      const currentOutput = parseFloat(current.outAmount);
+      const bestOutput = parseFloat(best.outAmount);
+      const currentImpact = parseFloat(current.priceImpactPct);
+      const bestImpact = parseFloat(best.priceImpactPct);
+      
+      // Prefer higher output with similar or better price impact
+      if (currentOutput > bestOutput && currentImpact <= bestImpact * 1.1) {
+        return current;
+      }
+      
+      return best;
+    });
+
+    const priceImpact = this.calculatePriceImpact(bestQuote);
+    const liquidityScore = this.calculateLiquidityScore(bestQuote);
+    
+    let executionRisk: 'low' | 'medium' | 'high';
+    if (priceImpact.severity === 'low' && liquidityScore >= 70) {
+      executionRisk = 'low';
+    } else if (priceImpact.severity === 'medium' || liquidityScore >= 40) {
+      executionRisk = 'medium';
+    } else {
+      executionRisk = 'high';
+    }
+
+    return {
+      route: bestQuote,
+      priceImpact,
+      liquidityScore,
+      executionRisk,
+      alternativeRoutes: quotes.filter(q => q !== bestQuote)
+    };
+  }
+
+  async optimizeSwapRoute(
+    inputMint: string,
+    outputMint: string,
+    amount: string,
+    maxSplits: number = 3
+  ): Promise<SwapRouteOptimization> {
+    const originalQuote = await this.getSwapQuote(inputMint, outputMint, amount);
+    if (!originalQuote) {
+      throw new Error('Could not get original quote');
+    }
+
+    // Try different slippage settings for optimization
+    const optimizedQuotes = await this.getMultipleSwapQuotes(
+      inputMint, outputMint, amount, [10, 25, 50, 100]
+    );
+
+    const bestOptimized = optimizedQuotes.reduce((best, current) => {
+      const currentOutput = parseFloat(current.outAmount);
+      const bestOutput = parseFloat(best.outAmount);
+      return currentOutput > bestOutput ? current : best;
+    }, optimizedQuotes[0] || originalQuote);
+
+    const originalOutput = parseFloat(originalQuote.outAmount);
+    const optimizedOutput = parseFloat(bestOptimized.outAmount);
+    const originalImpact = parseFloat(originalQuote.priceImpactPct);
+    const optimizedImpact = parseFloat(bestOptimized.priceImpactPct);
+
+    // Try split strategy for large trades
+    let splitStrategy;
+    const inputAmount = parseFloat(amount);
+    
+    if (inputAmount > 1000000 && originalImpact > 0.5) { // Large trade with significant impact
+      const splitSizes = [0.4, 0.35, 0.25]; // Split into 3 parts
+      const splits = [];
+      
+      for (const percentage of splitSizes) {
+        const splitAmount = Math.floor(inputAmount * percentage).toString();
+        const splitQuote = await this.getSwapQuote(inputMint, outputMint, splitAmount, 50);
+        
+        if (splitQuote) {
+          splits.push({
+            percentage,
+            route: splitQuote,
+            priceImpact: parseFloat(splitQuote.priceImpactPct)
+          });
+        }
+      }
+
+      if (splits.length > 0) {
+        const combinedPriceImpact = splits.reduce((sum, split) => 
+          sum + (split.priceImpact * split.percentage), 0
+        );
+
+        splitStrategy = {
+          splits,
+          combinedPriceImpact
+        };
+      }
+    }
+
+    return {
+      originalRoute: originalQuote,
+      optimizedRoute: bestOptimized,
+      improvement: {
+        priceImpactReduction: originalImpact - optimizedImpact,
+        outputIncrease: optimizedOutput - originalOutput,
+        feeReduction: 0 // Would need fee calculation
+      },
+      splitStrategy
+    };
+  }
+
+  async getMarketDepth(tokens: string[]): Promise<Map<string, MarketDepth>> {
+    const depths = new Map<string, MarketDepth>();
+    
+    for (const token of tokens) {
+      try {
+        // Sample small and large trades to estimate depth
+        const smallAmount = '1000000'; // 1M smallest units
+        const largeAmount = '100000000'; // 100M smallest units
+        
+        const [smallQuote, largeQuote] = await Promise.all([
+          this.getSwapQuote(TOKENS.USDC, token, smallAmount),
+          this.getSwapQuote(TOKENS.USDC, token, largeAmount)
+        ]);
+
+        if (smallQuote && largeQuote) {
+          const smallImpact = parseFloat(smallQuote.priceImpactPct);
+          const largeImpact = parseFloat(largeQuote.priceImpactPct);
+          
+          const spread = largeImpact - smallImpact;
+          let liquidityTier: 'high' | 'medium' | 'low';
+          
+          if (largeImpact < 0.5) liquidityTier = 'high';
+          else if (largeImpact < 2.0) liquidityTier = 'medium';
+          else liquidityTier = 'low';
+
+          depths.set(token, {
+            token,
+            bidDepth: parseFloat(largeQuote.outAmount),
+            askDepth: parseFloat(largeQuote.outAmount),
+            spread,
+            liquidityTier
+          });
+        }
+      } catch (error) {
+        console.error(`Error analyzing market depth for ${token}:`, error);
+      }
+    }
+
+    return depths;
+  }
+
   async findOptimalRebalanceRoutes(
     rebalances: Array<{ from: string; to: string; amount: string; priority: number }>
   ): Promise<OptimalRebalanceStrategy> {
@@ -199,29 +453,34 @@ export class JupiterPriceFeed {
     // Sort by priority (higher first)
     const sortedRebalances = rebalances.sort((a, b) => b.priority - a.priority);
 
-    for (const rebalance of sortedRebalances) {
-      const quote = await this.getSwapQuote(
+    // Analyze all routes in parallel for better optimization
+    const routePromises = sortedRebalances.map(async (rebalance) => {
+      const optimization = await this.optimizeSwapRoute(
         rebalance.from,
         rebalance.to,
-        rebalance.amount,
-        100 // 1% slippage for emergency rebalancing
+        rebalance.amount
       );
 
-      if (quote) {
-        const priceImpact = this.calculatePriceImpact(quote);
-        
-        const route: RebalanceRoute = {
-          inputToken: rebalance.from,
-          outputToken: rebalance.to,
-          inputAmount: rebalance.amount,
-          expectedOutput: quote.outAmount,
-          priceImpact,
-          route: quote,
-          priority: rebalance.priority
-        };
+      const bestRoute = optimization.optimizedRoute;
+      const priceImpact = this.calculatePriceImpact(bestRoute);
+      
+      return {
+        inputToken: rebalance.from,
+        outputToken: rebalance.to,
+        inputAmount: rebalance.amount,
+        expectedOutput: bestRoute.outAmount,
+        priceImpact,
+        route: bestRoute,
+        priority: rebalance.priority
+      };
+    });
 
-        routes.push(route);
-        totalPriceImpact += priceImpact.percentage;
+    const resolvedRoutes = await Promise.allSettled(routePromises);
+    
+    for (const result of resolvedRoutes) {
+      if (result.status === 'fulfilled') {
+        routes.push(result.value);
+        totalPriceImpact += result.value.priceImpact.percentage;
       }
     }
 
@@ -253,7 +512,11 @@ export class JupiterPriceFeed {
   ): Promise<OptimalRebalanceStrategy> {
     const rebalances: Array<{ from: string; to: string; amount: string; priority: number }> = [];
 
-    // Calculate required rebalances
+    // Get market depth for all tokens
+    const allTokens = [...new Set([...currentPositions.keys(), ...targetPositions.keys()])];
+    const marketDepths = await this.getMarketDepth(allTokens);
+
+    // Calculate required rebalances with market depth consideration
     for (const [token, currentAmount] of currentPositions) {
       const targetAmount = targetPositions.get(token) || 0;
       const difference = currentAmount - targetAmount;
@@ -263,38 +526,66 @@ export class JupiterPriceFeed {
           // Need to sell this token
           const sellAmount = Math.floor(difference * 1000000).toString(); // Convert to lamports/smallest unit
           
-          // Find best token to buy
-          for (const [targetToken, targetAmt] of targetPositions) {
-            const currentTargetAmount = currentPositions.get(targetToken) || 0;
-            if (currentTargetAmount < targetAmt) {
-              rebalances.push({
-                from: token,
-                to: targetToken,
-                amount: sellAmount,
-                priority: Math.abs(difference) // Higher difference = higher priority
-              });
-              break;
-            }
+          // Find best token to buy based on market depth and target needs
+          const buyOpportunities = Array.from(targetPositions.entries())
+            .filter(([targetToken, targetAmt]) => {
+              const currentTargetAmount = currentPositions.get(targetToken) || 0;
+              return currentTargetAmount < targetAmt;
+            })
+            .map(([targetToken, targetAmt]) => {
+              const currentTargetAmount = currentPositions.get(targetToken) || 0;
+              const need = targetAmt - currentTargetAmount;
+              const depth = marketDepths.get(targetToken);
+              const liquidityScore = depth ? (depth.liquidityTier === 'high' ? 3 : depth.liquidityTier === 'medium' ? 2 : 1) : 1;
+              
+              return {
+                token: targetToken,
+                need,
+                liquidityScore,
+                priority: need * liquidityScore
+              };
+            })
+            .sort((a, b) => b.priority - a.priority);
+
+          if (buyOpportunities.length > 0) {
+            const bestBuy = buyOpportunities[0];
+            rebalances.push({
+              from: token,
+              to: bestBuy.token,
+              amount: sellAmount,
+              priority: Math.abs(difference) * bestBuy.liquidityScore
+            });
           }
         }
       }
     }
 
-    // Filter routes by emergency threshold
+    // Filter routes by emergency threshold and optimize
     const strategy = await this.findOptimalRebalanceRoutes(rebalances);
     const filteredRoutes = strategy.routes.filter(route => 
       route.priceImpact.percentage <= emergencyThreshold
     );
 
+    // Re-calculate metrics for filtered routes
+    const filteredTotalImpact = filteredRoutes.reduce((sum, route) => sum + route.priceImpact.percentage, 0);
+    
+    let adjustedRiskLevel: 'low' | 'medium' | 'high';
+    if (filteredTotalImpact <= 1.0) adjustedRiskLevel = 'low';
+    else if (filteredTotalImpact <= 3.0) adjustedRiskLevel = 'medium';
+    else adjustedRiskLevel = 'high';
+
     return {
-      ...strategy,
       routes: filteredRoutes,
-      totalPriceImpact: filteredRoutes.reduce((sum, route) => sum + route.priceImpact.percentage, 0)
+      totalPriceImpact: filteredTotalImpact,
+      estimatedGasFeesSOL: filteredRoutes.length * 0.001,
+      expectedExecutionTime: filteredRoutes.length * 2.5,
+      riskLevel: adjustedRiskLevel
     };
   }
 
   clearCache(): void {
     this.cache.clear();
+    this.routeCache.clear();
   }
 }
 
