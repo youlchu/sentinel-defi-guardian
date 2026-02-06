@@ -7,7 +7,9 @@ export default function Home() {
         {/* Hero Section */}
         <div className="mb-12">
           <h1 className="text-6xl font-bold mb-4">
-            <span className="text-gradient">SENTINEL</span>
+            <span className="bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent">
+              SENTINEL
+            </span>
           </h1>
           <p className="text-2xl text-gray-300 mb-2">
             Autonomous DeFi Risk Guardian
